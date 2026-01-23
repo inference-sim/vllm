@@ -167,7 +167,7 @@ Understanding the scope and guarantees of journey tracing:
 
 ## Event Types
 
-Journey tracing emits **5 lifecycle event types**. Typical sequences:
+Journey tracing defines 6 event types; **5 are currently emitted** (DEPARTED reserved). Typical sequences:
 
 - **Without preemption**: QUEUED → SCHEDULED(FIRST) → FIRST_TOKEN → FINISHED
 - **With preemption**: QUEUED → SCHEDULED(FIRST) → PREEMPTED → SCHEDULED(RESUME) → ... → FIRST_TOKEN → FINISHED
@@ -720,7 +720,7 @@ def _emit_journey_event(...):
 3. **Flush Mechanism** (in `update_from_output`)
    - Copy events from buffer to `EngineCoreOutputs`
    - Clear buffer after flush (no duplication)
-   - Guaranteed delivery even without token output
+   - Events are surfaced even in iterations that produce no token outputs for a client (EngineCoreOutputs may be created solely to carry events).
 
 4. **Progress Tracking** (high-water mark dict)
    - `_journey_prefill_hiwater: dict[str, int]`
