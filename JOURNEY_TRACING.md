@@ -9,6 +9,7 @@
 - [What is Request Journey Tracing?](#what-is-request-journey-tracing)
 - [Why Use Journey Tracing?](#why-use-journey-tracing)
 - [Quick Start](#quick-start)
+- [Semantics & Guarantees](#semantics--guarantees)
 - [Event Types](#event-types)
 - [Event Data Structure](#event-data-structure)
 - [Common Use Cases](#common-use-cases)
@@ -24,11 +25,13 @@
 
 Request journey tracing is a lightweight observability feature that tracks the lifecycle of every request as it moves through the vLLM v1 scheduler. It emits **sparse lifecycle events** at key state transitions, providing detailed visibility into:
 
-- When requests enter and leave the system
+- When requests enter the scheduler (added to waiting queue)
 - When requests get scheduled for execution
 - When the first token is generated (important latency metric)
 - When requests get preempted (resource contention)
-- When and why requests complete
+- When requests complete within the scheduler (terminal state)
+
+**Scope**: Events track the request lifecycle **within the v1 scheduler**, from `add_request()` to terminal status. This does not include system-level ingress (API arrival) or egress (response departure).
 
 Each event includes a **complete progress snapshot** with accurate token counts that survive preemption, making it perfect for debugging, monitoring, and performance analysis.
 
@@ -47,7 +50,7 @@ Each event includes a **complete progress snapshot** with accurate token counts 
 - Understand scheduling patterns and bottlenecks
 
 ### 🎯 **Monitoring & Alerting**
-- Export events to observability platforms (OpenTelemetry, Prometheus, etc.)
+- Integrate events with your existing telemetry stack
 - Set up alerts for abnormal patterns (excessive preemptions, long queuing)
 - Track SLO compliance for request latencies
 
@@ -60,22 +63,31 @@ Each event includes a **complete progress snapshot** with accurate token counts 
 
 ## Quick Start
 
+**Note**: Journey tracing is a **v1 engine-core feature**. It is configured at the scheduler/engine level, not via the high-level `LLM` API.
+
 ### Enable Journey Tracing
 
 ```python
-from vllm import LLM
-from vllm.config import ObservabilityConfig
+from vllm.config import ObservabilityConfig, VllmConfig
 
-# Create config with journey tracing enabled
-llm = LLM(
-    model="facebook/opt-125m",
-    observability_config=ObservabilityConfig(
-        enable_journey_tracing=True
-    )
+# Create VllmConfig with journey tracing enabled
+observability_config = ObservabilityConfig(
+    enable_journey_tracing=True
+)
+
+vllm_config = VllmConfig(
+    # ... model_config, scheduler_config, etc.
+    observability_config=observability_config
+)
+
+# Pass to Scheduler or EngineCore
+scheduler = Scheduler(
+    vllm_config=vllm_config,
+    # ... other params
 )
 ```
 
-### Access Events in Engine Code
+### Access Events in Engine/Scheduler Integration Code
 
 ```python
 # In your engine/scheduler integration code
@@ -107,6 +119,8 @@ def process_events(engine_outputs):
                 journey_tracker[event.request_id].append(event)
 
 # Calculate TTFT (Time To First Token)
+# Note: This measures scheduler-QUEUED → first decode token
+# (includes queueing + prefill, but not API ingress time)
 def calculate_ttft(request_id):
     events = journey_tracker[request_id]
     queued = next((e for e in events if e.event_type == RequestJourneyEventType.QUEUED), None)
@@ -119,9 +133,46 @@ def calculate_ttft(request_id):
 
 ---
 
+## Semantics & Guarantees
+
+Understanding the scope and guarantees of journey tracing:
+
+### Scope
+- **Events track lifecycle within the v1 scheduler**, not end-to-end system flow
+- **Start point**: `scheduler.add_request()` (QUEUED event)
+- **End point**: Terminal scheduler status (FINISHED event)
+- **Not included**: API server arrival time, response departure from system
+
+### Timestamps
+- `ts_monotonic` uses `time.monotonic()` and is **process-local**
+- Use for relative timing within the same process
+- Not suitable for distributed tracing across processes without correlation
+
+### Event Delivery
+- Events are **buffered per-client** during scheduler iteration
+- Events are **flushed via `update_from_output()`** into `EngineCoreOutputs.journey_events`
+- Delivery is **best-effort within the scheduler loop**
+- External aborts may have `scheduler_step=None` (called outside schedule context)
+
+### Guarantees
+- **FIRST_TOKEN** is emitted at the token append site and **exactly once per request**
+- **Progress tracking survives preemption** via scheduler-side high-water mark
+- **scheduler_step** is monotonically increasing (when not None)
+- Events for a single request may be delivered across multiple `EngineCoreOutputs` batches
+
+### Reserved Event Types
+- **DEPARTED** (event type 6): Reserved for future use, not currently implemented
+
+---
+
 ## Event Types
 
-Journey tracing emits **5 lifecycle events** in order:
+Journey tracing emits **5 lifecycle event types**. Typical sequences:
+
+- **Without preemption**: QUEUED → SCHEDULED(FIRST) → FIRST_TOKEN → FINISHED
+- **With preemption**: QUEUED → SCHEDULED(FIRST) → PREEMPTED → SCHEDULED(RESUME) → ... → FIRST_TOKEN → FINISHED
+
+Events are buffered and flushed in batches via `update_from_output()`, so delivery may not be strictly sequential.
 
 ### 1. QUEUED 🔵
 **When**: Request is added to the scheduler's waiting queue
@@ -402,9 +453,9 @@ def analyze_preemption_impact(events_by_request):
 
 ---
 
-### Use Case 3: Real-Time Monitoring Dashboard
+### Use Case 3: Export to Monitoring System
 
-Stream events to a monitoring system:
+Integrate events with your existing telemetry stack:
 
 ```python
 import json
@@ -434,11 +485,12 @@ class JourneyEventExporter:
                         "finish_status": event.finish_status
                     }
 
-                    # Export to monitoring system
+                    # Export to your telemetry system
                     self.export(json.dumps(event_data))
 
-# Usage with Prometheus, OpenTelemetry, etc.
-exporter = JourneyEventExporter(lambda data: send_to_prometheus(data))
+# Example: integrate with your existing telemetry infrastructure
+# (send_to_prometheus, send_to_otel, etc. are your implementation)
+exporter = JourneyEventExporter(lambda data: send_to_your_telemetry(data))
 ```
 
 ---
@@ -556,9 +608,9 @@ Even after preemption, `num_output_tokens` is preserved.
 
 Journey tracing is **disabled by default** with near-zero overhead:
 
-- **CPU**: ~5-10 cycles per emission point (6 checks per request)
-- **Memory**: 0 bytes (no data structures allocated)
-- **Throughput impact**: <0.01%
+- **CPU**: Single boolean check per emission point (6 checks per request)
+- **Memory**: 0 bytes (no data structures allocated when disabled)
+- **Throughput impact**: Negligible
 
 **How?** Single boolean check at each emission point:
 ```python
@@ -569,7 +621,7 @@ def _emit_journey_event(...):
 
 ### Overhead When Enabled
 
-- **Event creation**: O(1) per event, ~200 bytes/event
+- **Event creation**: O(1) per event
 - **Progress snapshot**: O(1) - simple field access
 - **Buffering**: O(1) append to list
 - **Flush**: O(E) where E = events for that client
@@ -581,23 +633,28 @@ def _emit_journey_event(...):
 - With N preemptions: 5 + 2N events
 
 **Memory Usage**:
-- ~200-300 bytes per event
-- Events live ~1-10ms (between schedule and update_from_output)
-- Peak: ~10KB per 50 concurrent scheduled requests
+- Order of magnitude: hundreds of bytes per event
+- Events live briefly (between schedule and update_from_output)
+- Overhead scales with event emission rate
+
+**Expected Overhead**:
+- Overhead is proportional to the number of events emitted
+- For normal workloads with modest preemption rates, overhead is expected to be small
+- Benchmark your specific workload if throughput is critical
 
 ### When to Enable Journey Tracing
 
 ✅ **Good use cases**:
 - Development and debugging
 - Performance profiling sessions
-- Production monitoring (sampling recommended)
+- Production monitoring (see sampling note below)
 - Research and analysis
 
 ❌ **Avoid when**:
 - Maximum throughput is critical AND you don't need observability
-- Memory is extremely constrained (<1GB available)
+- Memory is extremely constrained
 
-**Production Recommendation**: Enable with **sampling** (e.g., 1% of requests) or enable on-demand for debugging.
+**Production Note**: Sampling (tracking a subset of requests) can be implemented in your event consumer/exporter if you want to reduce overhead. The feature itself currently traces all requests when enabled.
 
 ---
 
@@ -759,10 +816,11 @@ Journey events are designed for **production observability**, while EngineCoreEv
 
 ### Q: Does journey tracing impact throughput?
 
-**A**: Negligible impact (<0.01%) when disabled (default). When enabled, overhead depends on:
+**A**: When **disabled** (default), impact is negligible due to single boolean checks. When **enabled**, overhead depends on:
 - Event rate (function of request rate and preemption rate)
-- Typically <1% overhead for normal workloads
-- Use sampling in production if concerned
+- Overhead scales with the number of events emitted
+- Benchmark your specific workload if throughput is critical
+- Consumer-side sampling can reduce processing overhead
 
 ---
 
@@ -777,13 +835,13 @@ Journey events are designed for **production observability**, while EngineCoreEv
 
 ### Q: How do I export events to Prometheus/OpenTelemetry?
 
-**A**: Journey tracing provides the raw events. You need to:
+**A**: Journey tracing provides raw events attached to `EngineCoreOutputs`. Export is **not built-in**; you need to integrate with your existing telemetry stack:
 
 1. Collect events from `EngineCoreOutputs.journey_events`
 2. Transform to your observability format
-3. Export using appropriate client library
+3. Export using your telemetry client library
 
-Example for Prometheus:
+Example integration with Prometheus:
 ```python
 from prometheus_client import Counter, Histogram
 
@@ -825,7 +883,7 @@ def export_to_prometheus(event):
 
 ### Q: How long are events buffered?
 
-**A**: Events are buffered for a single scheduler iteration (~1-10ms typically):
+**A**: Events are buffered for a single scheduler iteration (duration depends on workload):
 1. Events emitted during `schedule()` and `update_from_output()`
 2. Buffered in `_journey_events_buffer_by_client`
 3. Flushed at end of `update_from_output()`
