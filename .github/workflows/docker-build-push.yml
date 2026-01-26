@@ -74,8 +74,8 @@ jobs:
           build-args: |
             CUDA_VERSION=12.9.1
             PYTHON_VERSION=3.12
-            max_jobs=16
-            nvcc_threads=8
+            max_jobs=2
+            nvcc_threads=1
             torch_cuda_arch_list=7.0 7.5 8.0 8.9 9.0 10.0 12.0
             buildkite_commit=${{ github.sha }}
             GIT_REPO_CHECK=0
@@ -96,8 +96,8 @@ jobs:
           build-args: |
             CUDA_VERSION=12.9.1
             PYTHON_VERSION=3.12
-            max_jobs=16
-            nvcc_threads=8
+            max_jobs=2
+            nvcc_threads=1
             torch_cuda_arch_list=7.0 7.5 8.0 8.9 9.0 10.0 12.0
             buildkite_commit=${{ github.sha }}
             GIT_REPO_CHECK=0
