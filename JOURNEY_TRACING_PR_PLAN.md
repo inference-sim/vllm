@@ -126,7 +126,7 @@ This document outlines the implementation plan for dual-stream journey tracing u
 | PR # | Branch | Goal | Size | Tests | Status |
 |------|--------|------|------|-------|--------|
 | #0 | `removelegacy` | Remove EngineCoreEvent | ~130 removed | 1 new + existing | ✅ **COMPLETED** |
-| #1 | `journey-tracing-01-scheduler-init` | Init tracer in scheduler | ~25 lines | 3 | Pending |
+| #1 | `pr1ofjourney` | Init tracer in scheduler | ~25 lines | 4 | ✅ **COMPLETED** |
 | #2 | `journey-tracing-02-core-spans-lifecycle` | Create & cleanup core spans | ~100 lines | 6 | **Cleanup in same PR** ✅ |
 | #3 | `journey-tracing-03-journey-state-cleanup` | Add journey state & cleanup | ~50 lines | 5 | Extends PR #2 cleanup |
 | #4 | `journey-tracing-04-journey-events-emit` | Emit events to core spans | ~120 lines | 6 | No new resources, defensive |
@@ -136,7 +136,7 @@ This document outlines the implementation plan for dual-stream journey tracing u
 | #8 | `journey-tracing-08-api-additional-events` | Emit API lifecycle events | ~80 lines | 5 | No new resources |
 | #9 | `journey-tracing-09-remove-buffering` | Remove legacy buffering | ~150 removed | 4 | Keep do_tracing() |
 
-**Total**: ~565 lines added, ~150 lines removed, 45 tests
+**Total**: ~565 lines added, ~150 lines removed, 46 tests
 
 ---
 
@@ -145,7 +145,7 @@ This document outlines the implementation plan for dual-stream journey tracing u
 ```
 PR #0 (Remove EngineCoreEvent) ✅ COMPLETED
     ↓
-PR #1 (Scheduler Tracer Init)
+PR #1 (Scheduler Tracer Init) ✅ COMPLETED
     ↓
 PR #2 (Core Span + Cleanup) ← MUST include cleanup in same PR
     ↓
@@ -172,9 +172,11 @@ PR #9 (Remove Buffering) ← depends on all above working
 
 ---
 
-### PR #1: Engine - Scheduler Tracer Init
+### PR #1: Engine - Scheduler Tracer Init ✅ COMPLETED
 
-**Branch**: `journey-tracing-01-scheduler-init`
+**Branch**: `pr1ofjourney`
+
+**Status**: ✅ **COMPLETED** - Ready to merge (pending final approval)
 
 **Goal**: Initialize tracer in scheduler without creating any per-request state.
 
@@ -185,7 +187,7 @@ PR #9 (Remove Buffering) ← depends on all above working
 ```python
 # vllm/v1/core/sched/scheduler.py
 
-# Add at top of file
+# Add at top of file (after existing imports)
 try:
     from vllm.tracing import SpanAttributes
 except Exception:
@@ -194,11 +196,13 @@ except Exception:
 class Scheduler:
     def __init__(
         self,
-        scheduler_config: SchedulerConfig,
-        cache_config: CacheConfig,
-        lora_config: LoraConfig | None,
-        parallel_config: ParallelConfig,
-        output_proc_callback: Optional[Callable] = None,
+        vllm_config: VllmConfig,
+        kv_cache_config: KVCacheConfig,
+        structured_output_manager: StructuredOutputManager,
+        block_size: int,
+        mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
+        include_finished_set: bool = False,
+        log_stats: bool = False,
     ) -> None:
         # ... existing initialization code ...
 
@@ -207,40 +211,64 @@ class Scheduler:
             self.observability_config.enable_journey_tracing
         )
 
+        # ... existing journey tracing state initialization ...
+
         # NEW: Initialize tracer for OTEL span creation
         self.tracer: Any | None = None
         if self._enable_journey_tracing:
             endpoint = self.observability_config.otlp_traces_endpoint
             if endpoint is not None:
-                from vllm.tracing import init_tracer
-                self.tracer = init_tracer("vllm.scheduler", endpoint)
+                try:
+                    from vllm.tracing import init_tracer
+                    self.tracer = init_tracer("vllm.scheduler", endpoint)
+                except Exception as e:
+                    logger.warning(
+                        "Failed to initialize tracer for journey tracing: %s", e
+                    )
 ```
+
+**Also Updated**:
+- `tests/v1/core/utils.py`: Added `otlp_traces_endpoint` parameter to `create_scheduler()`
+- `tests/v1/core/test_scheduler.py`: Added `patch` import for mocking
 
 #### Safety Checklist
 
-- ✅ No per-request state introduced
-- ✅ No spans created
-- ✅ No cleanup needed
-- ✅ Legacy tracing untouched
-- ✅ Zero overhead when disabled (tracer stays None)
-- ✅ Graceful degradation if OTEL not available
+- ✅ No per-request state introduced (only class-level tracer instance)
+- ✅ No spans created (just initialization)
+- ✅ No cleanup needed (tracer is shared, not per-request)
+- ✅ Legacy tracing untouched (journey event buffering unchanged)
+- ✅ Zero overhead when disabled (boolean + endpoint check)
+- ✅ Graceful degradation with warning log on failure
+- ✅ Backward compatible (all parameters optional)
 
-#### Tests
+#### Tests (All Passing)
 
 1. **`test_tracer_init_when_endpoint_set()`**
-   - Verify `scheduler.tracer` is not None when endpoint configured
-   - Verify tracer is instance of OTEL Tracer
+   - Uses mocking to avoid OTEL collector dependency
+   - Verifies `scheduler.tracer` is set to mock tracer
+   - Verifies `init_tracer()` called with correct parameters
 
 2. **`test_tracer_none_when_endpoint_not_set()`**
-   - Verify `scheduler.tracer` is None when endpoint not configured
-   - Verify no overhead
+   - Tests 3 negative cases: no endpoint, disabled flag, both
+   - Verifies `scheduler.tracer` is None in all cases
+   - Verifies no overhead when disabled
 
-3. **`test_no_crash_if_otel_missing()`**
-   - Verify graceful degradation if OTEL packages not installed
-   - Verify `SpanAttributes` is None fallback works
+3. **`test_scheduler_init_succeeds_with_tracing_enabled()`**
+   - Uses mocking for deterministic test
+   - Smoke test ensuring tracing config doesn't break scheduler
+   - Verifies tracer attribute exists and is set correctly
 
-**Size**: ~25 lines, 3 tests
+4. **`test_tracer_init_handles_failure_gracefully()`**
+   - Mocks `init_tracer()` to raise exception
+   - Verifies scheduler initializes successfully despite failure
+   - Verifies tracer is None when init fails
+   - Verifies defensive exception handling works
+
+**Test Results**: ✅ All 85 tests in test_scheduler.py passing (4 new, 81 existing)
+
+**Size**: ~25 lines production code, ~110 lines test code, 4 tests
 **Review Time**: ~10 minutes
+**Actual Implementation Time**: ~1 hour
 
 ---
 
@@ -1672,7 +1700,7 @@ Add this to every PR description:
 
 **Breakdown**:
 - PR #0: ✅ COMPLETED (Remove EngineCoreEvent)
-- PR #1: 0.5 day (tiny, foundational)
+- PR #1: ✅ COMPLETED (Scheduler tracer init - 0.5 day actual)
 - PR #2: 2 days (critical, includes cleanup)
 - PR #3: 1 day (extends cleanup)
 - PR #4: 1.5 days (event emission)
@@ -1815,7 +1843,7 @@ When reviewing each PR:
 
 Progress tracking:
 - **After PR #0**: ✅ EngineCoreEvent removed, Prometheus metrics restored
-- **After PR #1**: Tracer initialized
+- **After PR #1**: ✅ Tracer initialized (ready for span creation)
 - **After PR #2**: Core spans working (create + cleanup)
 - **After PR #3**: Journey state tracking working
 - **After PR #4**: Core events flowing to spans
@@ -1827,3 +1855,52 @@ Progress tracking:
   - Note: do_tracing() and RequestJourneyEvent preserved (not removed)
 
 Each milestone is independently safe and valuable.
+
+---
+
+## Implementation History
+
+### ✅ PR #0: Remove EngineCoreEvent System
+
+**Completed**: Prior to journey tracing implementation
+**Branch**: `removelegacy`
+**Commit**: 717f90eb5
+**Changes**: ~130 lines removed, 1 new test + existing tests passing
+**Impact**: Cleaned up legacy v0.0.1 metrics system, restored Prometheus metrics using RequestJourneyEvent timestamps
+
+### ✅ PR #1: Scheduler Tracer Initialization
+
+**Completed**: 2026-01-26
+**Branch**: `pr1ofjourney`
+**Status**: Ready to merge (pending final approval)
+
+**Implementation Summary**:
+- Added defensive `SpanAttributes` import with None fallback
+- Added tracer initialization in `Scheduler.__init__()` with try/except
+- Added `otlp_traces_endpoint` parameter to test utilities
+- Implemented 4 comprehensive tests with proper mocking
+
+**Changes**:
+- Production code: 19 lines added
+  - `vllm/v1/core/sched/scheduler.py`: 6 lines (import) + 13 lines (init)
+- Test utilities: 2 lines modified
+  - `tests/v1/core/utils.py`: Added parameter
+- Test code: 110 lines added
+  - `tests/v1/core/test_scheduler.py`: 4 new tests
+
+**Test Results**: ✅ All 85 tests passing (81 existing + 4 new)
+
+**Code Review**: Approved with fix applied
+- Issue identified: Test 3 initially called real `init_tracer()`
+- Fix applied: Added mock decorator for deterministic testing
+- All tests now properly mocked and isolated
+
+**Key Achievements**:
+- ✅ Zero per-request state introduced
+- ✅ Zero overhead when disabled
+- ✅ Defensive error handling with warning logs
+- ✅ Backward compatible (all parameters optional)
+- ✅ No regressions in existing tests
+- ✅ Foundation ready for PR #2 (core span creation)
+
+**Next Steps**: PR #2 will use `self.tracer` to create core spans with complete cleanup in same PR
