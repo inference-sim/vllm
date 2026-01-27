@@ -2255,6 +2255,7 @@ Condensed summary of completed PRs. See individual PR sections above for detaile
 ### ✅ PR #6: API Parent Span Lifecycle
 - **Completed**: 2026-01-27
 - **Branch**: `pr6ofjourney` (formerly `journey-tracing-06-api-spans-full-lifecycle`)
+- **Commit**: d5429c59d | **PR**: #14
 - **Changes**: ~150 production, ~420 test lines | 17 tests (all passing)
 - **Key Implementation Details**:
   - Added `_create_api_span()` method on `OpenAIServing` base class
