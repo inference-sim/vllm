@@ -187,7 +187,7 @@ def _end_core_span_and_cleanup(self, request: Request) -> None:
 | #2 | `journey-tracing-02-core-spans-lifecycle` | Create & cleanup core spans | ~100 lines | 6 | ✅ **COMPLETED** |
 | #3 | `pr3ofjourney` | Add journey state & cleanup | ~26 lines | 4 | ✅ **COMPLETED** |
 | #4 | `pr4ofjourney` | Emit events to core spans | ~113 lines | 9 | ✅ **COMPLETED** |
-| #5 | `journey-tracing-05-api-span-tracking` | Add API span tracking dict | ~20 lines | 2 | No Pydantic field |
+| #5 | `pr5ofjourney` | Add API span tracking dict | ~67 lines | 8 | ✅ **COMPLETED** |
 | #6 | `journey-tracing-06-api-spans-full-lifecycle` | Create & close API spans | ~150 lines | 9 | **All closure paths in same PR** ✅ |
 | #7 | `journey-tracing-07-context-propagation` | Link parent-child spans | ~25 lines | 4 | No new resources |
 | #8 | `journey-tracing-08-api-additional-events` | Emit API lifecycle events | ~80 lines | 5 | No new resources |
@@ -1003,13 +1003,37 @@ def finish_requests(self, ...):
 
 ### PR #5: API - Add Span Tracking Dict
 
-**Branch**: `journey-tracing-05-api-span-tracking`
+**Status**: ✅ Completed (PR #13 merged)
+
+**Branch**: `pr5ofjourney`
 
 **Goal**: Add separate dict for tracking API spans, avoiding Pydantic serialization risks.
 
 **Why Safe**: No per-request state in serializable models. Spans tracked in separate dict.
 
 **Key Decision**: Store spans in `_api_spans` dict instead of Pydantic model to avoid serialization issues.
+
+**What was implemented**:
+- Added `_api_spans` dict to track `(span, arrival_time, first_response_time)` tuples
+- Added `_cached_is_tracing_enabled` flag with defensive error handling (defaults to False on failure)
+- Added `_get_is_tracing_enabled()` async method with caching to avoid repeated engine calls
+- Added `_store_api_span()` method to insert span tracking entries
+- Added `_get_api_span_info()` method returning `(None, None, None)` for missing entries
+- Added `_cleanup_api_span()` method with idempotent `.pop()` for safe cleanup
+- All state is private (`_` prefix) and lives outside Pydantic models
+- Added 8 comprehensive unit tests covering all dict operations and edge cases
+
+**Tests added**: 8 tests (177 lines), all passing
+- `test_api_span_dict_initialized()` - Verify dict and cache initialized correctly
+- `test_store_and_retrieve_api_span()` - Store and retrieve span info
+- `test_retrieve_missing_request_returns_none_tuple()` - Safe defaults for missing entries
+- `test_cleanup_removes_api_span()` - Cleanup removes dict entry
+- `test_cleanup_nonexistent_request_is_safe()` - Cleanup is idempotent
+- `test_tracing_enabled_cache_works()` - Cache reduces async calls (call_count == 1)
+- `test_tracing_enabled_check_handles_errors()` - Error handling defaults to False
+- `test_multiple_requests_tracked_independently()` - Multi-request isolation
+
+**Size**: ~67 lines production code, 177 lines test code
 
 #### Changes
 
@@ -1020,25 +1044,33 @@ class OpenAIServing:
     def __init__(self, ...):
         # ... existing init ...
 
-        # NEW: Track API spans separately (not in Pydantic model)
+        # NEW: Track API spans separately (not in Pydantic model to avoid serialization)
         # Maps request_id → (span, arrival_time, first_response_time)
+        # Type hint 'Any' avoids OTEL import dependency (PR #6 will import OTEL)
         self._api_spans: dict[str, tuple[Any, float, float | None]] = {}
 
-        # Cache for tracing enabled check
+        # NEW: Cache for tracing enabled check (cached once, assumes config immutable)
         self._cached_is_tracing_enabled: bool | None = None
 
     async def _get_is_tracing_enabled(self) -> bool:
         """Check if journey tracing is enabled.
 
         Caches result to avoid repeated async calls to engine.
+        Cached once at startup; assumes tracing config is immutable.
+        Defaults to False on error (tracing must never break serving).
 
         Returns:
             True if journey tracing is enabled, False otherwise
         """
         if self._cached_is_tracing_enabled is None:
-            self._cached_is_tracing_enabled = (
-                await self.engine_client.is_tracing_enabled()
-            )
+            try:
+                self._cached_is_tracing_enabled = (
+                    await self.engine_client.is_tracing_enabled()
+                )
+            except Exception:
+                # Defensive: if check fails, assume tracing disabled
+                # Prevents repeated exceptions from impacting serving performance
+                self._cached_is_tracing_enabled = False
         return self._cached_is_tracing_enabled
 
     def _store_api_span(
@@ -1064,11 +1096,15 @@ class OpenAIServing:
 
         Returns:
             Tuple of (span, arrival_time, first_response_time)
+            Returns (None, None, None) if request not found
         """
         return self._api_spans.get(request_id, (None, None, None))
 
     def _cleanup_api_span(self, request_id: str) -> None:
-        """Remove API span tracking for a request (after span.end() called).
+        """Remove API span tracking for a request.
+
+        Safe to call even if span was never created (e.g., tracing disabled).
+        Called after span.end() in normal flow (PR #6 responsibility).
 
         Args:
             request_id: The request ID to cleanup
@@ -1086,17 +1122,7 @@ class OpenAIServing:
 
 #### Tests
 
-1. **`test_api_span_tracking_dict_exists()`**
-   - Verify `_api_spans` dict initialized
-   - Verify empty on startup
-
-2. **`test_store_and_get_api_span()`**
-   - Store mock span with timing info
-   - Retrieve and verify all fields
-   - Verify cleanup removes entry
-
-**Size**: ~20 lines, 2 tests
-**Review Time**: ~5 minutes
+(See "What was implemented" section above for full test list - 8 tests implemented)
 
 ---
 
@@ -2221,3 +2247,113 @@ Each milestone is independently safe and valuable.
 - ✅ No accumulation over 20 iterations (unit test)
 
 **Next Steps**: PR #4 will add `_compute_progress_snapshot()` and emit journey events to core spans
+
+### ✅ PR #4: Engine - Emit Journey Events to Core Spans
+
+**Completed**: 2026-01-26
+**Branch**: `pr4ofjourney`
+**Status**: ✅ **MERGED** (commit 6a58608de, PR #12)
+
+**Implementation Summary**:
+- Extended `_emit_journey_event()` to accept optional `span` parameter for dual emission
+- Added span emission logic with defensive error handling (try/except around all OTEL calls)
+- Updated all 6 call sites to pass span from `_core_spans` dictionary:
+  - `add_request()`: QUEUED event with current `scheduler_step_counter` (typically 0, not None)
+  - `schedule()`: SCHEDULED event with schedule kind (FIRST/RESUME)
+  - `_preempt_request()`: PREEMPTED event
+  - `update_from_output()`: FIRST_TOKEN event (0→N transition, with deduplication)
+  - `update_from_output()`: FINISHED event on natural completion (before cleanup)
+  - `finish_requests()`: FINISHED event with finish_status on explicit abort
+- Implemented `_compute_progress_snapshot()` method to compute progress once and reuse:
+  - Supports WAITING phase for QUEUED events (was PREFILL in legacy system)
+  - Uses high-water marks for prefill progress (handles preemption correctly)
+  - Returns phase, prefill_done/total_tokens, decode_done/max_tokens
+- Changed QUEUED event semantics:
+  - `scheduler_step` uses current counter (typically 0) instead of None
+  - `phase` reported as "WAITING" instead of "PREFILL"
+- Added FINISHED emission in natural completion path:
+  - Emitted in `update_from_output()` when `stopped=True`, before cleanup
+  - Includes `finish_status` attribute from `_map_finish_status()`
+- External termination path fallback: Uses `self.scheduler_step_counter` when `scheduler_step` not provided in `finish_requests()`
+- Progress snapshot computed once per event and reused for both span and buffer (performance optimization)
+
+**Changes**:
+- Production code: ~113 lines added (net, includes refactoring)
+  - `vllm/v1/core/sched/scheduler.py`: Event emission logic, progress snapshot computation
+- Test code: 328 lines added
+  - `tests/v1/core/test_scheduler.py`: 9 comprehensive tests
+  - `tests/v1/core/test_journey_events.py`: 8 lines modified (existing tests still passing)
+- Documentation: Updated JOURNEY_TRACING_PR_PLAN.md
+
+**Test Results**: ✅ All tests passing (9 new + all existing tests)
+
+**Tests** (all consolidated in `tests/v1/core/test_scheduler.py`):
+
+1. **`test_events_emitted_to_span()`**
+   - Verifies QUEUED and SCHEDULED events emitted to span
+   - Proves basic span emission integration works
+
+2. **`test_event_attributes_complete()`**
+   - Verifies all required attributes present (event_type, ts_monotonic, scheduler_step, phase, progress tokens, num_preemptions)
+   - Verifies optional attributes (schedule_kind for SCHEDULED)
+   - Proves attribute schema compliance
+
+3. **`test_defensive_error_handling()`**
+   - Mocks `span.add_event()` to raise exception
+   - Verifies request processing continues despite tracing failure
+   - Proves defensive programming works
+
+4. **`test_no_events_when_span_none()`**
+   - Tests graceful handling when `tracer=None` (no span created)
+   - Verifies no exceptions raised
+   - Verifies legacy buffering still works as fallback
+
+5. **`test_legacy_buffering_still_works()`**
+   - Verifies both span emission AND buffering happen in parallel
+   - Proves no regression to existing buffering system
+   - Verifies QUEUED uses step counter (0) not None
+
+6. **`test_first_token_dedup_set()`**
+   - Verifies `_first_token_emitted` set prevents duplicate FIRST_TOKEN emissions
+   - Proves deduplication logic works correctly
+
+7. **`test_first_token_transition_emitted()`**
+   - Verifies FIRST_TOKEN emitted on 0→N output token transition
+   - Tests integration with `update_from_output()` flow
+   - Proves transition detection works
+
+8. **`test_finished_emitted_to_span()`**
+   - Verifies FINISHED event emitted on natural completion (before cleanup)
+   - Verifies `finish_status` attribute present
+   - Verifies span.end() called (cleanup integration)
+   - Proves natural completion path works
+
+9. **`test_preempted_event_emitted()`**
+   - Verifies PREEMPTED event emitted when request preempted
+   - Tests `_preempt_request()` integration
+   - Proves preemption event emission works
+
+**Safety Guarantees**:
+- ✅ **No new resources created** - uses existing spans from PR #2, existing journey state from PR #3
+- ✅ **No new cleanup obligations** - spans already cleaned by `_end_core_span_and_cleanup()` from PR #2/#3
+- ✅ **Defensive programming** - try/except around all OTEL calls, tracing failures never break request processing
+- ✅ **Zero overhead when disabled** - early return on feature flag check
+- ✅ **Legacy buffering preserved** - parallel operation until PR #9, existing tests still passing
+- ✅ **Idempotent event emission** - safe span presence checks, no side effects on failure
+- ✅ **Progress computation optimized** - computed once, reused for span and buffer
+
+**Key Achievements**:
+- ✅ Core spans now emit all 5 journey lifecycle events (QUEUED, SCHEDULED, PREEMPTED, FIRST_TOKEN, FINISHED)
+- ✅ Full progress snapshots attached to every event
+- ✅ QUEUED semantics improved: uses scheduler_step counter, reports WAITING phase
+- ✅ FINISHED emitted on natural completion path (was missing before)
+- ✅ All 6 emission call sites updated consistently
+- ✅ Defensive error handling throughout (no crashes on OTEL failures)
+- ✅ No regressions in existing tests
+- ✅ Foundation ready for PR #5-#9 (API layer + cleanup)
+
+**Size**: ~113 lines production code, 328 lines test code, 9 tests
+**Actual Implementation Time**: ~2 hours
+**Review Time**: ~20 minutes
+
+**Next Steps**: PR #5 will add API span tracking dictionary (avoiding Pydantic serialization risks)
