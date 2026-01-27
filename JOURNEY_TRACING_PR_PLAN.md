@@ -1958,49 +1958,6 @@ Add this to every PR description:
 
 ---
 
-## Timeline Estimate
-
-| Phase | PRs | Time | Cumulative |
-|-------|-----|------|------------|
-| **Phase 0: Prerequisites** | #0 | ✅ DONE | 0 days |
-| **Phase 1: Core** | #1-4 | 1 week | 1 week |
-| **Phase 2: API** | #5-8 | 1 week | 2 weeks |
-| **Phase 3: Cleanup** | #9 | 1 day | ~2 weeks |
-
-**Breakdown**:
-- PR #0: ✅ COMPLETED (Remove EngineCoreEvent)
-- PR #1: ✅ COMPLETED (Scheduler tracer init - 0.5 day actual)
-- PR #2: ✅ COMPLETED (Core span lifecycle - 0.25 day actual)
-- PR #3: 1 day (extends cleanup)
-- PR #4: 1.5 days (event emission)
-- PR #5: 0.5 day (tiny, just fields)
-- PR #6: 2 days (critical, includes all closure)
-- PR #7: 1 day (context propagation)
-- PR #8: 1 day (additional events)
-- PR #9: 1 day (removal)
-
-**Total**: ~2 weeks for complete implementation
-
----
-
-## Review Time Estimates
-
-| PR | Review Time | Reason |
-|----|-------------|--------|
-| #1 | 10 min | Tiny, just tracer init |
-| #2 | 25 min | Critical, includes cleanup |
-| #3 | 15 min | Extends cleanup |
-| #4 | 20 min | Event emission |
-| #5 | 5 min | Trivial, just fields |
-| #6 | 30 min | Critical, all closure paths |
-| #7 | 15 min | Context propagation |
-| #8 | 15 min | Additional events |
-| #9 | 20 min | Code removal |
-
-**Total**: ~2.5 hours spread across 9 PRs
-**Compare to**: Many hours for single 800-line PR
-
----
 
 ## Benefits of This Disciplined Approach
 
@@ -2013,26 +1970,6 @@ Add this to every PR description:
 7. **Better Testing**: Each piece tested thoroughly before building next
 8. **Clear Progress**: 9 milestones with visible checkpoints
 9. **Parallel Potential**: Some PRs (e.g., #5) can be developed in parallel with others
-
----
-
-## Rollback Strategy
-
-Each PR can be independently reverted without breaking others:
-
-| Revert | Impact | System State |
-|--------|--------|--------------|
-| PR #1 | Tracer removed | No tracing, legacy works |
-| PR #2 | Core spans removed | No core spans, legacy works |
-| PR #3 | Journey state removed | Simplified core spans, legacy works |
-| PR #4 | Event emission removed | Silent core spans, legacy works |
-| PR #5 | Metadata fields removed | API spans can't be stored |
-| PR #6 | API spans removed | No API spans, legacy works |
-| PR #7 | Context propagation removed | Parent-child link broken but both work |
-| PR #8 | Additional events removed | Fewer events but lifecycle complete |
-| PR #9 | Legacy buffering restored | Both buffering and spans active |
-
-**All rollbacks maintain system stability and correctness.**
 
 ---
 
@@ -2073,19 +2010,6 @@ Each PR can be independently reverted without breaking others:
 
 ---
 
-## Key Differences from Initial Plan
-
-| Initial Plan (Bad) | This Plan (Good) |
-|-------------------|------------------|
-| PR creates spans, separate PR cleans them | Same PR creates + cleans |
-| PR creates API spans, later PR adds ABORTED | Same PR creates + adds DEPARTED/ABORTED |
-| 11 PRs with dependencies | 9 PRs, each self-consistent |
-| "We'll fix leaks later" | No leaks possible |
-| Reviewer must trust future PRs | Reviewer can verify each PR independently |
-| Technical debt accumulation | Zero technical debt |
-
----
-
 ## Final Notes
 
 ### For Implementer
@@ -2108,252 +2032,58 @@ When reviewing each PR:
 5. Verify legacy tracing untouched
 6. Confirm PR is independently safe
 
-### For Project Manager
-
-Progress tracking:
-- **After PR #0**: ✅ EngineCoreEvent removed, Prometheus metrics restored
-- **After PR #1**: ✅ Tracer initialized (ready for span creation)
-- **After PR #2**: Core spans working (create + cleanup)
-- **After PR #3**: Journey state tracking working
-- **After PR #4**: Core events flowing to spans
-- **After PR #5**: API metadata ready
-- **After PR #6**: API spans working (full lifecycle)
-- **After PR #7**: Parent-child linkage working
-- **After PR #8**: All API events flowing
-- **After PR #9**: Journey event buffering removed, dual-stream feature complete
-  - Note: do_tracing() and RequestJourneyEvent preserved (not removed)
-
-Each milestone is independently safe and valuable.
-
 ---
 
 ## Implementation History
 
-### ✅ PR #0: Remove EngineCoreEvent System
+Condensed summary of completed PRs. See individual PR sections above for detailed implementation notes.
 
-**Completed**: Prior to journey tracing implementation
-**Branch**: `removelegacy`
-**Commit**: 717f90eb5
-**Changes**: ~130 lines removed, 1 new test + existing tests passing
-**Impact**: Cleaned up legacy v0.0.1 metrics system, restored Prometheus metrics using RequestJourneyEvent timestamps
+### ✅ PR #0: Remove EngineCoreEvent System
+- **Completed**: 2026-01-25 (prior to journey tracing)
+- **Commit**: 717f90eb5
+- **Changes**: ~130 lines removed, 1 new test
+- **Impact**: Removed legacy v0.0.1 metrics system, restored Prometheus metrics using RequestJourneyEvent timestamps
+
+---
 
 ### ✅ PR #1: Scheduler Tracer Initialization
+- **Completed**: 2026-01-26
+- **Branch**: `pr1ofjourney` | **Commit**: 24f263656 | **PR**: #10
+- **Changes**: +19 production, +110 test lines | 4 tests
+- **Key**: Added tracer initialization to scheduler with defensive error handling, zero per-request state
 
-**Completed**: 2026-01-26
-**Branch**: `pr1ofjourney`
-**Status**: ✅ **MERGED** (commit 24f263656)
-
-**Implementation Summary**:
-- Added defensive `SpanAttributes` import with None fallback
-- Added tracer initialization in `Scheduler.__init__()` with try/except
-- Added `otlp_traces_endpoint` parameter to test utilities
-- Implemented 4 comprehensive tests with proper mocking
-
-**Changes**:
-- Production code: 19 lines added
-  - `vllm/v1/core/sched/scheduler.py`: 6 lines (import) + 13 lines (init)
-- Test utilities: 2 lines modified
-  - `tests/v1/core/utils.py`: Added parameter
-- Test code: 110 lines added
-  - `tests/v1/core/test_scheduler.py`: 4 new tests
-
-**Test Results**: ✅ All 85 tests passing (81 existing + 4 new)
-
-**Code Review**: Approved with fix applied
-- Issue identified: Test 3 initially called real `init_tracer()`
-- Fix applied: Added mock decorator for deterministic testing
-- All tests now properly mocked and isolated
-
-**Key Achievements**:
-- ✅ Zero per-request state introduced
-- ✅ Zero overhead when disabled
-- ✅ Defensive error handling with warning logs
-- ✅ Backward compatible (all parameters optional)
-- ✅ No regressions in existing tests
-- ✅ Foundation ready for PR #2 (core span creation)
-
-**Next Steps**: PR #2 will use `self.tracer` to create core spans with complete cleanup in same PR
+---
 
 ### ✅ PR #2: Core Span Lifecycle Management
+- **Completed**: 2026-01-26
+- **Branch**: `pr2ofjourney` | **Commit**: d46cdf231 | **PR**: #33115
+- **Changes**: +125 production, +245 test lines | 6 tests
+- **Key**: Added `_core_spans` dict, span creation/cleanup on all termination paths with try/finally blocks
 
-**Completed**: 2026-01-26
-**Branch**: `pr2ofjourney`
-**Status**: ✅ **MERGED** (commit d46cdf231)
-
-**Implementation Summary**:
-- Added `_core_spans` dictionary to track active spans per request
-- Created `_create_core_span()` helper with explicit OpenTelemetry parameters
-- Created `_end_core_span_and_cleanup()` idempotent helper
-- Modified `add_request()` to create and store core spans
-- Modified `update_from_output()` with try/finally (natural completion path)
-- Modified `finish_requests()` with try/finally (explicit abort path)
-
-**Changes**:
-- Production code: ~125 lines added
-  - `vllm/v1/core/sched/scheduler.py`: Core span lifecycle
-- Test code: ~245 lines added
-  - `tests/v1/core/test_scheduler.py`: 6 new tests
-
-**Test Results**: ✅ All 91 tests passing (6 new, 85 existing)
-
-**Safety Guarantees**:
-- ✅ All termination paths properly cleanup spans (no leaks)
-- ✅ Cleanup uses try/finally (runs even if teardown throws)
-- ✅ Defensive error handling (tracing never crashes requests)
-- ✅ Zero overhead when tracing disabled
-- ✅ Idempotent cleanup (safe to call multiple times)
-
-**Next Steps**: PR #3 will add journey state tracking with integrated cleanup
+---
 
 ### ✅ PR #3: Journey State Cleanup
+- **Completed**: 2026-01-26
+- **Branch**: `pr3ofjourney` | **Commit**: f4cf7903c | **PR**: #11
+- **Changes**: 26 production modified, +162 test lines | 4 tests
+- **Key**: Extended cleanup to handle journey state, fixed memory leak, decoupled span vs state cleanup
 
-**Completed**: 2026-01-26
-**Branch**: `pr3ofjourney`
-**Status**: ✅ **COMPLETED** (commit f4cf7903c, PR #33126)
+---
 
-**Implementation Summary**:
-- Extended `_end_core_span_and_cleanup()` with decoupled cleanup logic
-- Removed duplicate inline cleanup from `finish_requests()`
-- Added comprehensive docstring explaining two independent cleanup concerns
-- Fixed memory leak on natural completion path
+### ✅ PR #4: Emit Journey Events to Core Spans
+- **Completed**: 2026-01-26
+- **Branch**: `pr4ofjourney` | **Commit**: 6a58608de | **PR**: #12
+- **Changes**: +113 production, +328 test lines | 9 tests
+- **Key**: Added event emission to spans (QUEUED, SCHEDULED, PREEMPTED, FIRST_TOKEN, FINISHED), defensive error handling, parallel buffering
 
-**Changes**:
-- Production code: 26 lines modified
-  - `vllm/v1/core/sched/scheduler.py`: Extended cleanup method
-- Test code: 162 lines added
-  - `tests/v1/core/test_scheduler.py`: 4 new tests
-- Documentation: Updated JOURNEY_TRACING_PR_PLAN.md
+---
 
-**Test Results**: ✅ All 95 tests passing (4 new, 91 existing)
+### ✅ PR #5: Add API Span Tracking Dict
+- **Completed**: 2026-01-27
+- **Branch**: `pr5ofjourney` | **Commit**: 3d11f662d | **PR**: #13
+- **Changes**: +67 production, +177 test lines | 8 tests
+- **Key**: Added `_api_spans` dict to OpenAIServing, helper methods with error handling, avoids Pydantic serialization risks
 
-**Code Review**: Approved by ChatGPT (2 rounds of feedback)
-- Round 1: Simplified tests, removed unused imports, rewrote leak test as unit test
-- Round 2: Fresh mock spans per iteration
-- All feedback applied
+---
 
-**Key Achievements**:
-- ✅ Fixed critical memory leak on natural completion path
-- ✅ Decoupled cleanup: span cleanup (always) vs journey state (gated)
-- ✅ Centralized all cleanup in single method
-- ✅ Removed duplicate cleanup logic
-- ✅ Tests are focused, fast, and maintainable
-- ✅ No regressions in existing tests
-- ✅ Foundation ready for PR #4 (event emission)
-
-**Safety Guarantees**:
-- ✅ Span cleanup NEVER gated behind feature flags
-- ✅ Journey state cleanup only runs when enabled
-- ✅ Both termination paths verified (natural + explicit abort)
-- ✅ No accumulation over 20 iterations (unit test)
-
-**Next Steps**: PR #4 will add `_compute_progress_snapshot()` and emit journey events to core spans
-
-### ✅ PR #4: Engine - Emit Journey Events to Core Spans
-
-**Completed**: 2026-01-26
-**Branch**: `pr4ofjourney`
-**Status**: ✅ **MERGED** (commit 6a58608de, PR #12)
-
-**Implementation Summary**:
-- Extended `_emit_journey_event()` to accept optional `span` parameter for dual emission
-- Added span emission logic with defensive error handling (try/except around all OTEL calls)
-- Updated all 6 call sites to pass span from `_core_spans` dictionary:
-  - `add_request()`: QUEUED event with current `scheduler_step_counter` (typically 0, not None)
-  - `schedule()`: SCHEDULED event with schedule kind (FIRST/RESUME)
-  - `_preempt_request()`: PREEMPTED event
-  - `update_from_output()`: FIRST_TOKEN event (0→N transition, with deduplication)
-  - `update_from_output()`: FINISHED event on natural completion (before cleanup)
-  - `finish_requests()`: FINISHED event with finish_status on explicit abort
-- Implemented `_compute_progress_snapshot()` method to compute progress once and reuse:
-  - Supports WAITING phase for QUEUED events (was PREFILL in legacy system)
-  - Uses high-water marks for prefill progress (handles preemption correctly)
-  - Returns phase, prefill_done/total_tokens, decode_done/max_tokens
-- Changed QUEUED event semantics:
-  - `scheduler_step` uses current counter (typically 0) instead of None
-  - `phase` reported as "WAITING" instead of "PREFILL"
-- Added FINISHED emission in natural completion path:
-  - Emitted in `update_from_output()` when `stopped=True`, before cleanup
-  - Includes `finish_status` attribute from `_map_finish_status()`
-- External termination path fallback: Uses `self.scheduler_step_counter` when `scheduler_step` not provided in `finish_requests()`
-- Progress snapshot computed once per event and reused for both span and buffer (performance optimization)
-
-**Changes**:
-- Production code: ~113 lines added (net, includes refactoring)
-  - `vllm/v1/core/sched/scheduler.py`: Event emission logic, progress snapshot computation
-- Test code: 328 lines added
-  - `tests/v1/core/test_scheduler.py`: 9 comprehensive tests
-  - `tests/v1/core/test_journey_events.py`: 8 lines modified (existing tests still passing)
-- Documentation: Updated JOURNEY_TRACING_PR_PLAN.md
-
-**Test Results**: ✅ All tests passing (9 new + all existing tests)
-
-**Tests** (all consolidated in `tests/v1/core/test_scheduler.py`):
-
-1. **`test_events_emitted_to_span()`**
-   - Verifies QUEUED and SCHEDULED events emitted to span
-   - Proves basic span emission integration works
-
-2. **`test_event_attributes_complete()`**
-   - Verifies all required attributes present (event_type, ts_monotonic, scheduler_step, phase, progress tokens, num_preemptions)
-   - Verifies optional attributes (schedule_kind for SCHEDULED)
-   - Proves attribute schema compliance
-
-3. **`test_defensive_error_handling()`**
-   - Mocks `span.add_event()` to raise exception
-   - Verifies request processing continues despite tracing failure
-   - Proves defensive programming works
-
-4. **`test_no_events_when_span_none()`**
-   - Tests graceful handling when `tracer=None` (no span created)
-   - Verifies no exceptions raised
-   - Verifies legacy buffering still works as fallback
-
-5. **`test_legacy_buffering_still_works()`**
-   - Verifies both span emission AND buffering happen in parallel
-   - Proves no regression to existing buffering system
-   - Verifies QUEUED uses step counter (0) not None
-
-6. **`test_first_token_dedup_set()`**
-   - Verifies `_first_token_emitted` set prevents duplicate FIRST_TOKEN emissions
-   - Proves deduplication logic works correctly
-
-7. **`test_first_token_transition_emitted()`**
-   - Verifies FIRST_TOKEN emitted on 0→N output token transition
-   - Tests integration with `update_from_output()` flow
-   - Proves transition detection works
-
-8. **`test_finished_emitted_to_span()`**
-   - Verifies FINISHED event emitted on natural completion (before cleanup)
-   - Verifies `finish_status` attribute present
-   - Verifies span.end() called (cleanup integration)
-   - Proves natural completion path works
-
-9. **`test_preempted_event_emitted()`**
-   - Verifies PREEMPTED event emitted when request preempted
-   - Tests `_preempt_request()` integration
-   - Proves preemption event emission works
-
-**Safety Guarantees**:
-- ✅ **No new resources created** - uses existing spans from PR #2, existing journey state from PR #3
-- ✅ **No new cleanup obligations** - spans already cleaned by `_end_core_span_and_cleanup()` from PR #2/#3
-- ✅ **Defensive programming** - try/except around all OTEL calls, tracing failures never break request processing
-- ✅ **Zero overhead when disabled** - early return on feature flag check
-- ✅ **Legacy buffering preserved** - parallel operation until PR #9, existing tests still passing
-- ✅ **Idempotent event emission** - safe span presence checks, no side effects on failure
-- ✅ **Progress computation optimized** - computed once, reused for span and buffer
-
-**Key Achievements**:
-- ✅ Core spans now emit all 5 journey lifecycle events (QUEUED, SCHEDULED, PREEMPTED, FIRST_TOKEN, FINISHED)
-- ✅ Full progress snapshots attached to every event
-- ✅ QUEUED semantics improved: uses scheduler_step counter, reports WAITING phase
-- ✅ FINISHED emitted on natural completion path (was missing before)
-- ✅ All 6 emission call sites updated consistently
-- ✅ Defensive error handling throughout (no crashes on OTEL failures)
-- ✅ No regressions in existing tests
-- ✅ Foundation ready for PR #5-#9 (API layer + cleanup)
-
-**Size**: ~113 lines production code, 328 lines test code, 9 tests
-**Actual Implementation Time**: ~2 hours
-**Review Time**: ~20 minutes
-
-**Next Steps**: PR #5 will add API span tracking dictionary (avoiding Pydantic serialization risks)
+**Summary**: 5 PRs completed, ~350 production lines added, ~1022 test lines added, 31 tests passing
