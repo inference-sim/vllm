@@ -10,8 +10,8 @@ This document outlines the implementation plan for dual-stream journey tracing u
 - **Parent-Child Linkage**: Via W3C Trace Context propagation (traceparent headers)
 - **Real-Time Emission**: Events emitted directly to spans (no buffering)
 
-**Timeline**: ~2 weeks for complete implementation
-**Total Changes**: ~618 lines added, ~280 lines removed, 77 tests
+**Timeline**: ~2 weeks for complete implementation (Jan 23-27, 2026)
+**Total Changes**: ~7,528 lines added, ~1,116 lines removed, 27+ journey tracing tests
 
 ---
 
@@ -191,9 +191,9 @@ def _end_core_span_and_cleanup(self, request: Request) -> None:
 | #6 | `pr6ofjourney` | Create & close API spans | ~150 lines | 17 | ✅ **COMPLETED** |
 | #7 | `journey-tracing-07-context-propagation` | Link parent-child spans | ~25 lines | 12 | ✅ **COMPLETED** |
 | #8 | `pr8ofjourney` | Emit API lifecycle events | ~112 lines | 12 | ✅ **COMPLETED** |
-| #9 | `journey-tracing-09-remove-buffering` | Remove journey event buffering | ~150 removed | 4 | Clean break |
+| #9 | `journey-tracing-09-remove-buffering` | Remove journey event buffering | ~389 removed, ~478 added | 16 | Clean break |
 
-**Total**: ~618 lines added, ~280 lines removed, 77 tests
+**Total**: ~7,528 lines added, ~1,116 lines removed, 27+ journey tracing tests
 
 ---
 
@@ -2076,7 +2076,7 @@ async def chat_completion_full_generator(self, ...):
 
 ---
 
-**Estimated Scope**: ~150 lines removed (buffering logic), ~50-100 lines added (direct timestamp capture), 5+ tests
+**Actual Implementation**: ~389 lines removed (buffering logic), ~478 lines added (direct timestamp capture + 16 comprehensive tests)
 **Review Focus**: Verify no hidden buffering remains, metrics work independently, spans work end-to-end
 
 ---
