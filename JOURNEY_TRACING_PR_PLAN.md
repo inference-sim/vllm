@@ -33,11 +33,28 @@ This document outlines the implementation plan for dual-stream journey tracing u
 - ✅ Journey event buffering (still needed for do_tracing())
 
 **What was added**:
-- Timestamp extraction from `RequestJourneyEvent` to restore Prometheus metrics
-- `queued_ts` from first QUEUED event
-- `scheduled_ts` from first SCHEDULED event
+- Restored Prometheus metrics using journey event timestamp extraction (interim approach)
+- Note: Journey event timestamps were later replaced by direct monotonic timestamp capture in PR #9
 
-**Key clarification**: EngineCoreEvent was the "legacy" system (now removed). The current tracing system is `RequestJourneyEvent` + `do_tracing()` (kept and functional).
+**Key clarification**: EngineCoreEvent was the "legacy" system (now removed). The current tracing system is `RequestJourneyEvent` + `do_tracing()` (kept functional through PR #8, removed in PR #9).
+
+---
+
+## ✅ Implementation Status
+
+**Completed PRs** (Jan 23-27, 2026):
+- ✅ **PR #0**: Remove EngineCoreEvent System (commit 717f90eb5, PR #7)
+- ✅ **PR #1**: Initialize OTEL tracer in scheduler (commit 24f263656, PR #8)
+- ✅ **PR #2**: Core span lifecycle management (commit d46cdf231, PR #10)
+- ✅ **PR #3**: Journey state cleanup (commit 35c46c3b1, PR #11)
+- ✅ **PR #4**: Emit journey events to core spans (commit 6a58608de, PR #12)
+- ✅ **PR #5**: API span tracking infrastructure (commit 91fa916a0, PR #13)
+- ✅ **PR #6**: API parent span lifecycle (commit d01e6a0fb, PR #14)
+- ✅ **PR #7**: API↔Engine context propagation (commit c2540aff3, PR #15)
+- ✅ **PR #8**: API lifecycle events and request attributes (commit 959dd77fd, PR #16)
+- ✅ **PR #9**: Remove journey event buffering (commit b37142cc1, PR #17)
+
+**Status**: All 9 PRs implemented and tested. Journey tracing dual-stream architecture fully operational.
 
 ---
 
@@ -1951,6 +1968,18 @@ async def chat_completion_full_generator(self, ...):
 - Any existing public API signatures that accept journey event parameters (deprecated but ignored for backward compatibility)
 - Request state needed for Prometheus metrics (queued/scheduled timestamps)
 - All OTEL span emission paths from PRs #2-8 (unchanged and authoritative)
+
+**Timestamp Propagation Path** (New in PR #9):
+```
+Scheduler (Request.{queued_ts, scheduled_ts})
+  ↓ time.monotonic() capture at event occurrence
+EngineCoreOutput.{queued_ts, scheduled_ts}
+  ↓ copied from Request in SchedulerOutput
+OutputProcessor.process_outputs()
+  ↓ propagated to RequestState
+req_state.stats.{queued_ts, scheduled_ts}
+  ↓ used for Prometheus metrics
+```
 
 ---
 
