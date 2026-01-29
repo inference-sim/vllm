@@ -63,6 +63,7 @@ def create_scheduler(
     step_tracing_enabled: bool = False,
     step_tracing_sample_rate: float = 0.01,
     step_tracing_rich_subsample_rate: float = 0.001,
+    journey_tracing_sample_rate: float = 1.0,
 ) -> Scheduler | AsyncScheduler:
     """Create scheduler under test.
 
@@ -143,6 +144,7 @@ def create_scheduler(
         step_tracing_enabled=step_tracing_enabled,
         step_tracing_sample_rate=step_tracing_sample_rate,
         step_tracing_rich_subsample_rate=step_tracing_rich_subsample_rate,
+        journey_tracing_sample_rate=journey_tracing_sample_rate,
     )
 
     vllm_config = VllmConfig(

@@ -1905,6 +1905,30 @@ class Scheduler(SchedulerInterface):
             )
             return None
 
+        # Check if API layer sampled this request (engine obeys API decision)
+        from vllm.tracing import VLLM_JOURNEY_SAMPLED_HEADER
+        if not request.trace_headers:
+            logger.debug(
+                "Skipping core span for request %s (no trace headers, conservative skip)",
+                request.request_id
+            )
+            return None
+
+        sampled = request.trace_headers.get(VLLM_JOURNEY_SAMPLED_HEADER)
+        if sampled != "1":
+            logger.debug(
+                "Skipping core span for request %s (not sampled by API, header=%s)",
+                request.request_id,
+                sampled
+            )
+            return None
+
+        logger.debug(
+            "Creating core span for request %s (API sampled, header=%s)",
+            request.request_id,
+            sampled
+        )
+
         try:
             import time
             from vllm.tracing import extract_trace_context, SpanAttributes
@@ -2634,8 +2658,11 @@ class Scheduler(SchedulerInterface):
 
         # Compute progress snapshot and timestamps ONCE (reused for both span and buffering)
         progress = self._compute_progress_snapshot(request, event_type=event_type)
-        ts_monotonic = time.monotonic()
-        ts_epoch_ns = time.time_ns()
+
+        # Single clock read for exact consistency (derive float from int)
+        ts_monotonic_ns = time.monotonic_ns()  # Primary: int nanoseconds
+        ts_monotonic = ts_monotonic_ns / 1e9   # Derived: float seconds (exact consistency)
+        ts_epoch_ns = time.time_ns()            # Unchanged: epoch timestamp for OTEL
 
         # NEW: Emit to span (parallel to legacy buffering)
         # CRITICAL: Defensive span emission - wrap ALL OTEL calls in try/except
@@ -2647,6 +2674,7 @@ class Scheduler(SchedulerInterface):
                     attributes = {
                         SpanAttributes.JOURNEY_EVENT_TYPE: event_type.name,
                         SpanAttributes.JOURNEY_TS_MONOTONIC: ts_monotonic,
+                        SpanAttributes.JOURNEY_TS_MONOTONIC_NS: ts_monotonic_ns,
                         SpanAttributes.JOURNEY_SCHEDULER_STEP: scheduler_step,
                         SpanAttributes.JOURNEY_PHASE: progress["phase"],
                         SpanAttributes.JOURNEY_PREFILL_DONE_TOKENS: progress["prefill_done_tokens"],

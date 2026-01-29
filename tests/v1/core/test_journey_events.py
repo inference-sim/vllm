@@ -511,5 +511,89 @@ def test_hiwater_monotonic_across_preemption_cycles():
     )
 
 
+def test_journey_event_timestamp_backward_compatibility():
+    """Verify ts_monotonic_ns field has backward-compatible default.
+
+    Ensures old code creating RequestJourneyEvent without ts_monotonic_ns
+    works correctly (msgspec fills default value 0).
+    """
+    from vllm.v1.core.sched.journey_events import (
+        RequestJourneyEvent,
+        RequestJourneyEventType,
+        ScheduleKind,
+    )
+
+    # Create event WITHOUT ts_monotonic_ns (old code pattern)
+    event = RequestJourneyEvent(
+        request_id="test-req-123",
+        event_type=RequestJourneyEventType.SCHEDULED,
+        ts_monotonic=1234567890.123456,  # Float seconds
+        # ts_monotonic_ns not specified (backward compat test)
+        scheduler_step=1,
+        prefill_done_tokens=0,
+        prefill_total_tokens=100,
+        decode_done_tokens=0,
+        decode_max_tokens=50,
+        phase="PREFILL",
+        num_preemptions_so_far=0,
+        schedule_kind=ScheduleKind.FIRST,
+        finish_status=None,
+    )
+
+    # Verify default value filled
+    assert event.ts_monotonic_ns == 0, "Default ts_monotonic_ns should be 0 (legacy sentinel)"
+    assert isinstance(event.ts_monotonic_ns, int), "ts_monotonic_ns must be int"
+
+
+def test_journey_event_dual_timestamp_exact_consistency():
+    """Verify dual-write timestamp precision with exact consistency.
+
+    Tests that ts_monotonic (float) and ts_monotonic_ns (int) represent
+    the identical instant when both are explicitly set (derived from same clock read).
+    """
+    from vllm.v1.core.sched.journey_events import (
+        RequestJourneyEvent,
+        RequestJourneyEventType,
+    )
+    import time
+
+    # Simulate production code: single clock read, derive float
+    ts_monotonic_ns = time.monotonic_ns()
+    ts_monotonic = ts_monotonic_ns / 1e9
+
+    # Create event with both timestamps
+    event = RequestJourneyEvent(
+        request_id="test-req-456",
+        event_type=RequestJourneyEventType.QUEUED,
+        ts_monotonic=ts_monotonic,
+        scheduler_step=None,
+        prefill_done_tokens=0,
+        prefill_total_tokens=100,
+        decode_done_tokens=0,
+        decode_max_tokens=50,
+        phase="PREFILL",
+        num_preemptions_so_far=0,
+        schedule_kind=None,
+        finish_status=None,
+        ts_monotonic_ns=ts_monotonic_ns,
+    )
+
+    # Type checks
+    assert isinstance(event.ts_monotonic, float), "ts_monotonic must be float"
+    assert isinstance(event.ts_monotonic_ns, int), "ts_monotonic_ns must be int"
+
+    # Sanity checks
+    assert event.ts_monotonic > 0, "ts_monotonic must be positive"
+    assert event.ts_monotonic_ns > 0, "ts_monotonic_ns must be positive"
+
+    # Exact consistency check (integer round-trip, avoids float equality issues)
+    # Convert float to nanoseconds and compare in integer domain
+    assert int(round(event.ts_monotonic * 1e9)) == event.ts_monotonic_ns, (
+        f"Timestamps must be consistent: "
+        f"ts_monotonic={event.ts_monotonic}s ({int(round(event.ts_monotonic * 1e9))}ns), "
+        f"ts_monotonic_ns={event.ts_monotonic_ns}ns"
+    )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

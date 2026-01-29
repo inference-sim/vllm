@@ -435,23 +435,12 @@ class OpenAIServingChat(OpenAIServing):
                             arrival_time = time.monotonic()
                             self._store_api_span(request_id, api_span, arrival_time)
 
-                            # Inject API span context into trace_headers for parent-child linkage
+                            # Inject API span context and sampling header for parent-child linkage
                             # This enables the scheduler to create core span as child of API span
-                            try:
-                                from vllm.tracing import inject_trace_context
-                                trace_headers = inject_trace_context(api_span, trace_headers)
-                                logger.debug(
-                                    "Injected API span context into trace_headers for request %s",
-                                    request_id,
-                                )
-                            except Exception as e:
-                                # Injection failure should not break request processing
-                                # Core span will be created as root span instead
-                                logger.debug(
-                                    "Failed to inject API span context for request %s: %s",
-                                    request_id,
-                                    e,
-                                )
+                            # and signals the API sampling decision
+                            trace_headers = self._inject_trace_context_and_sampling_header(
+                                api_span, trace_headers, request_id
+                            )
 
                             # Set request attributes on API span
                             if isinstance(sampling_params, SamplingParams):

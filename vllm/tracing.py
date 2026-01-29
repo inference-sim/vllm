@@ -8,6 +8,7 @@ from vllm.logger import init_logger
 from vllm.utils.func_utils import run_once
 
 TRACE_HEADERS = ["traceparent", "tracestate"]
+VLLM_JOURNEY_SAMPLED_HEADER = "x-vllm-journey-sampled"  # vLLM-specific sampling decision
 
 logger = init_logger(__name__)
 
@@ -246,6 +247,7 @@ class SpanAttributes:
     # Journey event attributes (for request lifecycle span events)
     JOURNEY_EVENT_TYPE = "event.type"
     JOURNEY_TS_MONOTONIC = "ts.monotonic"
+    JOURNEY_TS_MONOTONIC_NS = "ts.monotonic_ns"
     # API event attributes (for API layer span events)
     EVENT_TS_MONOTONIC = "event.ts.monotonic"
     JOURNEY_PHASE = "phase"

@@ -13,7 +13,13 @@ It uses **OpenTelemetry (OTEL)** to create distributed traces with two linked sp
 - **API Span** (`llm_request`) - Tracks the request through your API server
 - **Core Span** (`llm_core`) - Tracks processing in the inference engine
 
+*Note: When using the OpenAI-compatible API server (`vllm serve`), both spans are created. Direct AsyncLLM usage can produce core-only traces, but only for requests where you manually pass trace_headers={"x-vllm-journey-sampled": "1"}. Otherwise no spans are created.*
+
 Events are emitted **in real-time** as requests progress through different states, giving you detailed timing and progress information at every step.
+
+**For production workloads:** Journey tracing supports **probabilistic sampling** to reduce overhead at high request rates. You can trace a subset of requests (e.g., 10% or 1%) while maintaining negligible overhead for untraced requests. See [Sampling for Production](#sampling-for-production) for details.
+
+**Note:** Sampling currently works with the OpenAI-compatible API server (`vllm serve`). Direct usage of `AsyncLLM` requires manual trace header management.
 
 ---
 
@@ -79,15 +85,17 @@ curl http://localhost:8000/v1/chat/completions \
 ### Step 4: View Traces in Jaeger
 
 1. Open http://localhost:16686
-2. Select service "vllm.api" or "vllm.scheduler"
+2. In the service dropdown, select your vLLM service (default: "vllm" or value of `OTEL_SERVICE_NAME`)
 3. Click "Find Traces"
 4. Click on any trace to see the complete request journey
 
 You'll see a timeline with two spans:
-- **llm_request** (API layer) - parent span
-- **llm_core** (Engine layer) - child span
+- **llm_request** (API layer) - parent span, created by scope `vllm.api`
+- **llm_core** (Engine layer) - child span, created by scope `vllm.scheduler`
 
 Each span contains events showing the request lifecycle.
+
+**Note:** The service dropdown shows `service.name` (configurable via `OTEL_SERVICE_NAME` environment variable). The tracer scopes `vllm.api` and `vllm.scheduler` appear as attributes within spans (`scope.name`), not as selectable services in the UI.
 
 ---
 
@@ -95,7 +103,7 @@ Each span contains events showing the request lifecycle.
 
 ### Two-Layer Span Architecture
 
-Every request creates two linked spans that show the complete journey:
+When using the OpenAI API server (`vllm serve`), each traced request creates two linked spans that show the complete journey:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -295,21 +303,99 @@ Journey tracing helps you understand system behavior at scale:
 - Preemption rate (% of requests with preemptions)
 - Error rate (% of requests ending in ABORTED)
 
-**Sampling for production:**
-vLLM traces all requests when enabled. For high-volume production, use sampling:
+---
 
-**Server-side sampling** (reduces vLLM overhead - CPU, memory, network):
+## Sampling for Production
+
+When using the OpenAI API server (`vllm serve`), vLLM creates traces for **all requests** by default when journey tracing is enabled. For high-volume production workloads, you have three sampling strategies:
+
+### Strategy 1: vLLM Native Sampling (Recommended ⭐)
+
+**What it does:** vLLM probabilistically samples requests **before creating any spans**. Sampled-out requests have near-zero tracing overhead.
+
+**When to use:** High request rates (>1000 RPS) where you want to minimize vLLM's CPU/memory/network overhead.
+
+**Requirements:** Works with the OpenAI-compatible API server (`vllm serve`). Direct `AsyncLLM` usage requires manual trace header management.
+
+**How it works:**
+- OpenAI API server makes a probabilistic sampling decision per request
+- If sampled out: no API span, no engine span, no events (near-zero overhead)
+- If sampled in: complete trace created (both API + engine spans)
+- **End-to-end atomic**: either both spans exist or neither (no partial traces)
+
+**Configuration:**
+
 ```bash
-# Set before starting vLLM to sample 10% of traces at the source
+# Sample 10% of requests (90% have near-zero tracing overhead)
+vllm serve MODEL \
+    --enable-journey-tracing \
+    --otlp-traces-endpoint http://localhost:4317 \
+    --journey-tracing-sample-rate 0.1
+```
+
+The `--journey-tracing-sample-rate` parameter accepts values from 0.0 to 1.0:
+- `1.0` (default) - Trace all requests (100%, backward compatible)
+- `0.1` - Trace 10% of requests (recommended for high-volume production)
+- `0.01` - Trace 1% of requests (for very high-volume production)
+- `0.0` - Trace no requests (effectively disables journey tracing)
+
+**Performance impact:**
+- Sampled-out requests: Sub-microsecond overhead (single random number check)
+- Sampled-in requests: Normal tracing overhead (~1-3% CPU)
+- Network traffic reduced proportionally (10% sampling = 90% less OTLP traffic)
+
+**Example:** At 10,000 RPS with 10% sampling:
+- 1,000 requests/sec get full traces (normal overhead)
+- 9,000 requests/sec have sub-microsecond overhead (just sampling check)
+- 90% reduction in OTLP network traffic to collector
+
+---
+
+### Strategy 2: OTEL SDK Sampling (Application-Level)
+
+**What it does:** OTEL SDK samples traces **after spans are created** based on the W3C Trace Context `sampled` bit.
+
+**When to use:** When you want vLLM to create all spans (full overhead) but only export a subset to the collector.
+
+**How it works:**
+- vLLM creates all spans and events (full overhead)
+- OTEL SDK decides whether to export each trace to the collector
+- Reduces network traffic and backend storage, but **not vLLM overhead**
+
+**Configuration:**
+
+```bash
+# Sample 10% at OTEL SDK level
 export OTEL_TRACES_SAMPLER=traceidratio
 export OTEL_TRACES_SAMPLER_ARG=0.1
 
-vllm serve MODEL --enable-journey-tracing --otlp-traces-endpoint http://localhost:4317
+vllm serve MODEL \
+    --enable-journey-tracing \
+    --otlp-traces-endpoint http://localhost:4317
 ```
 
-**Collector-side sampling** (reduces storage only, vLLM still creates all traces):
+**Important:** OTEL sampling is **independent** from vLLM sampling:
+- vLLM sampling gates span creation (saves vLLM overhead)
+- OTEL sampling gates span export (saves network/storage)
+- They can be combined: e.g., vLLM samples 10%, OTEL samples another 10% of those = 1% final
+
+---
+
+### Strategy 3: Collector-Side Sampling (Backend-Level)
+
+**What it does:** OTEL collector samples traces **after receiving them** from vLLM.
+
+**When to use:** When you want to reduce backend storage but keep vLLM overhead (e.g., for debugging).
+
+**How it works:**
+- vLLM creates and exports all traces (full overhead)
+- Collector decides which traces to forward to backend
+- Reduces backend storage only, **not vLLM or network overhead**
+
+**Configuration:**
+
 ```yaml
-# OTEL collector config - samples after receiving traces
+# OTEL collector config.yaml
 processors:
   probabilistic_sampler:
     sampling_percentage: 10
@@ -322,7 +408,37 @@ service:
       exporters: [jaeger]
 ```
 
-For high request rates (>1000 RPS), use server-side sampling to reduce vLLM overhead.
+---
+
+### Choosing the Right Strategy
+
+| Strategy | Reduces vLLM Overhead | Reduces Network | Reduces Storage | When to Use |
+|----------|----------------------|-----------------|-----------------|-------------|
+| **vLLM Native** | ✅ Yes | ✅ Yes | ✅ Yes | **Recommended for production** - reduces all overhead |
+| **OTEL SDK** | ❌ No | ✅ Yes | ✅ Yes | Want full vLLM instrumentation with selective export |
+| **Collector** | ❌ No | ❌ No | ✅ Yes | Need flexible sampling rules at collector level |
+
+**Recommendation for production:**
+- **< 1,000 RPS:** Use default (no sampling) - overhead is negligible
+- **1,000 - 10,000 RPS:** Use vLLM native sampling at 10-20% (`--journey-tracing-sample-rate 0.1`)
+- **> 10,000 RPS:** Use vLLM native sampling at 1-5% (`--journey-tracing-sample-rate 0.01`)
+
+**Combining strategies:**
+You can combine vLLM sampling with OTEL/collector sampling for multi-stage reduction:
+
+```bash
+# Stage 1: vLLM samples 10% of requests (reduces vLLM overhead by 90%)
+# Stage 2: OTEL SDK samples 50% of those (further reduces network by 50%)
+# Final result: 5% of requests traced (0.1 * 0.5 = 0.05)
+
+export OTEL_TRACES_SAMPLER=traceidratio
+export OTEL_TRACES_SAMPLER_ARG=0.5
+
+vllm serve MODEL \
+    --enable-journey-tracing \
+    --otlp-traces-endpoint http://localhost:4317 \
+    --journey-tracing-sample-rate 0.1
+```
 
 ---
 
@@ -335,20 +451,38 @@ For high request rates (>1000 RPS), use server-side sampling to reduce vLLM over
 --otlp-traces-endpoint URL        # OTEL collector endpoint
 ```
 
+### Optional Flags
+
+```bash
+--journey-tracing-sample-rate RATE    # Sampling rate [0.0-1.0], default 1.0
+                                       # 1.0 = trace all (100%, no sampling)
+                                       # 0.1 = trace 10% of requests
+                                       # 0.01 = trace 1% of requests
+```
+
 ### Common Configurations
 
-**Local development (Jaeger):**
+**Local development (Jaeger, all requests):**
 ```bash
 vllm serve MODEL \
     --enable-journey-tracing \
     --otlp-traces-endpoint http://localhost:4317
 ```
 
-**Production (external collector):**
+**Production (external collector, 10% sampling):**
 ```bash
 vllm serve MODEL \
     --enable-journey-tracing \
-    --otlp-traces-endpoint http://otel-collector.internal:4317
+    --otlp-traces-endpoint http://otel-collector.internal:4317 \
+    --journey-tracing-sample-rate 0.1
+```
+
+**High-volume production (1% sampling):**
+```bash
+vllm serve MODEL \
+    --enable-journey-tracing \
+    --otlp-traces-endpoint http://otel-collector.internal:4317 \
+    --journey-tracing-sample-rate 0.01
 ```
 
 **With other observability features:**
@@ -356,6 +490,7 @@ vllm serve MODEL \
 vllm serve MODEL \
     --enable-journey-tracing \
     --otlp-traces-endpoint http://localhost:4317 \
+    --journey-tracing-sample-rate 0.1 \
     --enable-metrics \
     --enable-mfu-metrics
 ```
@@ -367,10 +502,12 @@ vLLM supports standard OTEL environment variables:
 ```bash
 # Alternative: Use environment variables
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
-export OTEL_SERVICE_NAME=vllm-production
+export OTEL_SERVICE_NAME=vllm-production  # This is what you'll select in Jaeger UI
 
 vllm serve MODEL --enable-journey-tracing
 ```
+
+**Note:** `OTEL_SERVICE_NAME` sets the `service.name` resource attribute, which is what appears in the Jaeger/Tempo service dropdown. If not set, it defaults to "vllm". The tracer scopes (`vllm.api`, `vllm.scheduler`) are separate instrumentation scope names that appear as span attributes.
 
 ---
 
@@ -430,9 +567,9 @@ Journey tracing is **disabled by default** with negligible overhead:
 - No events emitted
 - Single boolean check per potential emission point
 
-### When Enabled
+### When Enabled (No Sampling)
 
-Overhead depends on your workload:
+With default `journey_tracing_sample_rate=1.0` (100% of requests traced):
 
 **Typical overhead (ballpark estimates):**
 - **CPU:** ~1-3% additional CPU for span creation and event emission
@@ -446,10 +583,32 @@ Overhead depends on your workload:
 - Preemption rate (more preemptions = more events per request)
 - OTEL exporter config (batching reduces overhead)
 
+### When Enabled (With Sampling)
+
+With `journey_tracing_sample_rate < 1.0` (sampling enabled):
+
+**Per-request overhead:**
+- **Sampled-out requests:** Sub-microsecond (single random number check + header check)
+- **Sampled-in requests:** Normal tracing overhead (~1-3% CPU)
+
+**Overall impact:**
+- At 10% sampling: 90% of requests have near-zero overhead
+- At 1% sampling: 99% of requests have near-zero overhead
+- Network/storage reduced proportionally
+
+**Example: 10,000 RPS with 10% sampling:**
+- 9,000 req/s: Sub-microsecond overhead each (negligible)
+- 1,000 req/s: Normal tracing overhead (~1-3% CPU)
+- Network: 90% reduction in OTLP traffic
+- Overall CPU impact: ~0.1-0.3% instead of ~1-3%
+
 **Recommendations:**
-- ✅ Safe to enable in production with moderate traffic
-- ✅ Use server-side sampling for high-volume production (>1000 RPS)
+- ✅ Safe to enable in production with moderate traffic (<1000 RPS) without sampling
+- ✅ Use vLLM native sampling for high-volume production (>1000 RPS)
+  - 1,000-10,000 RPS: `--journey-tracing-sample-rate 0.1` (10%)
+  - >10,000 RPS: `--journey-tracing-sample-rate 0.01` (1%)
 - ✅ Monitor CPU/memory before and after enabling
+- ✅ Adjust sample rate based on observed overhead
 - ⚠️ Overhead scales with request rate, not model size
 
 ---
@@ -522,33 +681,42 @@ Overhead depends on your workload:
 
 **Solutions:**
 
-1. **Enable server-side sampling** (reduces vLLM overhead):
+1. **Use vLLM native sampling** (recommended - reduces all overhead):
    ```bash
-   # Set before starting vLLM to sample 10% at source
+   # Sample 10% of requests at source (90% have near-zero overhead)
+   vllm serve MODEL \
+       --enable-journey-tracing \
+       --otlp-traces-endpoint http://localhost:4317 \
+       --journey-tracing-sample-rate 0.1
+   ```
+
+   This is the most effective solution because:
+   - ✅ Reduces vLLM CPU/memory overhead (sampled-out requests skip span creation)
+   - ✅ Reduces network traffic to collector (fewer traces exported)
+   - ✅ Reduces backend storage (fewer traces stored)
+
+2. **Alternative: OTEL SDK sampling** (reduces network/storage only):
+   ```bash
+   # Set before starting vLLM to sample 10% at OTEL SDK level
    export OTEL_TRACES_SAMPLER=traceidratio
    export OTEL_TRACES_SAMPLER_ARG=0.1
 
    vllm serve MODEL --enable-journey-tracing --otlp-traces-endpoint http://localhost:4317
    ```
 
-   Or use collector-side sampling (reduces storage only):
-   ```yaml
-   # OTEL collector config
-   processors:
-     probabilistic_sampler:
-       sampling_percentage: 10
-   ```
+   Note: This still creates all spans in vLLM (full overhead), only exports subset.
 
-2. **Use batch export:**
+3. **Use batch export:**
    ```bash
    # OTEL exporter batches traces
    export OTEL_BSP_SCHEDULE_DELAY=5000  # Batch every 5s
    export OTEL_BSP_MAX_EXPORT_BATCH_SIZE=512
    ```
 
-3. **Check request rate:**
-   - Very high request rates (>1000 RPS) may need sampling
+4. **Check request rate:**
+   - High request rates (>1000 RPS) should use vLLM sampling
    - Monitor CPU/memory after enabling
+   - Adjust sample rate based on observed overhead
 
 ### Trace Context Issues
 
@@ -616,6 +784,187 @@ service:
 ### Q: Can I customize span names or attributes?
 
 **A:** Not currently. Span names (`llm_request`, `llm_core`) and event types are fixed for consistency.
+
+### Q: What's the difference between vLLM sampling and OTEL sampling?
+
+**A:** They operate at different levels:
+
+**vLLM Native Sampling** (`--journey-tracing-sample-rate`):
+- Decides **before creating spans** whether to trace a request
+- Sampled-out requests have sub-microsecond overhead
+- Reduces vLLM CPU, memory, network, and storage
+- **End-to-end atomic**: either both API and engine spans exist, or neither
+- Works with OpenAI API server (`vllm serve`)
+- Recommended for production workloads
+
+**OTEL SDK Sampling** (`OTEL_TRACES_SAMPLER` env vars):
+- Decides **after creating spans** whether to export them
+- All requests have full span creation overhead
+- Only reduces network traffic and backend storage
+- Controlled by OpenTelemetry SDK (W3C Trace Context sampled bit)
+
+**Independence:** These are completely independent:
+- You can use both together (e.g., vLLM samples 10%, OTEL samples 50% of those → 5% final)
+- vLLM sampling does **not** use or modify the W3C traceparent sampled bit
+- OTEL sampling can still drop traces that vLLM created
+
+**Example combinations:**
+```bash
+# Option 1: vLLM sampling only (recommended)
+vllm serve MODEL --journey-tracing-sample-rate 0.1  # 10% sampled
+
+# Option 2: OTEL sampling only (full vLLM overhead)
+export OTEL_TRACES_SAMPLER=traceidratio
+export OTEL_TRACES_SAMPLER_ARG=0.1  # 10% sampled
+
+# Option 3: Both (multiplicative: 0.1 * 0.5 = 5% final)
+export OTEL_TRACES_SAMPLER=traceidratio
+export OTEL_TRACES_SAMPLER_ARG=0.5
+vllm serve MODEL --journey-tracing-sample-rate 0.1
+```
+
+### Q: Are partial traces possible (API span without engine span)?
+
+**A:** No. vLLM's native sampling is **end-to-end atomic**:
+- When the API samples a request, it creates the API span AND signals the engine to create the engine span
+- When the API samples out a request, neither span is created
+- The custom header `x-vllm-journey-sampled` propagates the decision from API to engine
+- This guarantees complete traces: either both spans exist with all events, or nothing exists
+
+This atomicity is maintained even in distributed deployments where API and engine run in separate processes.
+
+### Q: Does sampling work with AsyncLLM (direct Python usage)?
+
+**A:** Partially, but with important differences:
+
+**OpenAI API Server (`vllm serve`):**
+- ✅ Automatic sampling works out of the box
+- Set `--journey-tracing-sample-rate` and requests are automatically sampled
+- API server handles all header management
+
+**Direct AsyncLLM usage:**
+- ❌ No automatic sampling - `AsyncLLM` doesn't implement sampling logic
+- ✅ Manual control available - set `trace_headers={"x-vllm-journey-sampled": "1"}` on requests you want traced
+- Without the header, the engine will skip span creation (conservative behavior)
+- Useful when you want explicit control over which specific requests to trace
+
+**Example:**
+```python
+from vllm.v1.engine.async_llm import AsyncLLM
+
+llm = AsyncLLM(...)
+
+# To trace this request, manually set the header:
+llm.add_request(
+    request_id="req1",
+    prompt="Hello",
+    params=sampling_params,
+    trace_headers={"x-vllm-journey-sampled": "1"}  # Manual header
+)
+
+# Without header, no tracing happens (engine skips span creation)
+llm.add_request(
+    request_id="req2",
+    prompt="World",
+    params=sampling_params,
+)
+```
+
+---
+
+## Technical Details (Advanced)
+
+This section covers internal implementation details for developers and advanced users.
+
+### Sampling Architecture
+
+**Authority Model (OpenAI API Server):**
+- **OpenAI API server** is the authority: makes the sampling decision
+- **Engine layer** obeys: checks the decision and creates span only if sampled
+- Decision propagates via custom header: `x-vllm-journey-sampled: 1`
+- **Note:** This applies when using `vllm serve`. Direct `AsyncLLM` usage requires manual header management.
+
+**Decision Flow (OpenAI API Server):**
+```
+1. Request arrives at OpenAI API server
+2. API server checks: random.random() < journey_tracing_sample_rate?
+   - If NO: Return early, no API span created, no header set → engine skips too
+   - If YES: Create API span, set header "x-vllm-journey-sampled: 1"
+3. Request forwarded to engine with trace headers
+4. Engine checks: header present and value == "1"?
+   - If NO: Skip core span creation
+   - If YES: Create core span as child of API span
+```
+
+**Atomicity Guarantee:**
+- API span created ⟺ Header set to "1" ⟺ Engine span created
+- No partial traces: either both spans exist or neither
+- Thread-safe: decision made once per request at API boundary
+
+**W3C Trace Context Independence:**
+- vLLM sampling uses custom header `x-vllm-journey-sampled` (not W3C traceparent sampled bit)
+- W3C traceparent still propagated normally for OTEL context linking
+- OTEL SDK sampling (traceparent sampled bit) is completely independent
+- Client-provided traceparent is respected and propagated unchanged
+
+**Deployment Modes:**
+
+**OpenAI API Server (`vllm serve`):**
+- Automatic sampling: API server makes probabilistic decision per request
+- Works in both single-process and multi-process deployments
+- Headers propagate automatically (in-process dict or serialized)
+- No manual configuration needed
+
+**Direct AsyncLLM Usage:**
+- **No automatic sampling**: `AsyncLLM` does not implement sampling logic
+- Users must manually set `trace_headers` parameter with `x-vllm-journey-sampled: "1"` if tracing desired
+- Without header, engine will skip core span creation (conservative behavior)
+- Useful when caller wants explicit control over which requests to trace
+
+### Span Hierarchy
+
+All vLLM journey traces follow this structure:
+
+```
+Trace (trace_id from client or generated)
+└─ llm_request span (API layer, SpanKind.SERVER)
+   ├─ Attributes: gen_ai.request_id, gen_ai.response.model, etc.
+   ├─ Events: api.ARRIVED, api.DEPARTED / api.ABORTED
+   └─ llm_core span (Engine layer, SpanKind.INTERNAL, child of llm_request)
+      ├─ Attributes: gen_ai.request_id
+      └─ Events: journey.QUEUED, journey.SCHEDULED, journey.FIRST_TOKEN, etc.
+```
+
+**Parent-Child Linking:**
+- API span context injected into `trace_headers` dict using W3C Trace Context propagation
+- Engine extracts parent context from `trace_headers` when creating core span
+- Same trace ID, different span IDs, proper parent-child relationship
+
+**Tracer Scopes:**
+- `vllm.api` - API layer tracer (creates `llm_request` spans)
+- `vllm.scheduler` - Engine layer tracer (creates `llm_core` spans)
+- Both use the same global OTEL TracerProvider (singleton pattern)
+- **Important:** Scope names (`vllm.api`, `vllm.scheduler`) are NOT service names. In Jaeger/Tempo UI, you select traces by `service.name` (e.g., "vllm", configured via `OTEL_SERVICE_NAME`), then view scope names as attributes within spans.
+
+### Backward Compatibility
+
+The default behavior is **identical** to versions without sampling support:
+
+**Default config:**
+- `journey_tracing_sample_rate = 1.0` (100%, no sampling)
+- When set to 1.0: `random.random() < 1.0` always true → always sample
+
+**Migration path:**
+- Existing deployments: No changes needed, works as before
+- Opt-in sampling: Add `--journey-tracing-sample-rate` flag when ready
+- Gradual rollout: Start with 0.5 (50%), decrease based on needs
+
+**Config precedence:**
+1. `enable_journey_tracing` must be True (master switch)
+2. `otlp_traces_endpoint` must be set (where to send traces)
+3. `journey_tracing_sample_rate` determines what fraction (default 1.0)
+
+If `enable_journey_tracing=False`, no traces are created regardless of sample rate.
 
 ---
 
