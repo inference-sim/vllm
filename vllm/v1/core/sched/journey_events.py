@@ -25,7 +25,6 @@ class RequestJourneyEventType(enum.IntEnum):
     FIRST_TOKEN = 3  # First decode token produced
     PREEMPTED = 4  # Moved to PREEMPTED status
     FINISHED = 5  # Request completed (terminal state)
-    DEPARTED = 6  # Response left system (stretch goal, not yet implemented)
 
 
 class ScheduleKind(enum.IntEnum):
@@ -45,11 +44,11 @@ class RequestJourneyEvent(msgspec.Struct, frozen=True):
     - prefill_done_tokens: High-water mark of prompt tokens processed
       (survives preemption, tracked via scheduler-side dict)
     - decode_done_tokens: Output tokens generated (from num_output_tokens)
-    - phase: Current processing phase (PREFILL or DECODE)
+    - phase: Current processing phase (WAITING, PREFILL, or DECODE)
 
     Scheduler Context:
     - scheduler_step: Monotonic counter from Scheduler.scheduler_step_counter
-      (None only for QUEUED events before first schedule)
+      (0 for QUEUED events, None if event emitted before scheduler initialization)
     """
     # Identity
     request_id: str
@@ -64,7 +63,7 @@ class RequestJourneyEvent(msgspec.Struct, frozen=True):
     prefill_total_tokens: int  # Total prompt tokens (len(prompt_token_ids))
     decode_done_tokens: int  # Output tokens generated (num_output_tokens)
     decode_max_tokens: int  # Max generation tokens (max_tokens)
-    phase: Literal["PREFILL", "DECODE"]  # "DECODE" if num_output_tokens > 0
+    phase: Literal["WAITING", "PREFILL", "DECODE"]  # WAITING=queued, PREFILL=prefill, DECODE=decode
 
     # Lifecycle tracking
     num_preemptions_so_far: int  # Number of preemptions for this request
