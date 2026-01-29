@@ -154,7 +154,7 @@ Events on the `llm_core` span:
 Each event includes detailed attributes:
 
 **Progress Tracking:**
-- `phase` - Current phase: "waiting", "prefill", or "decode"
+- `phase` - Current phase: "WAITING" (queued), "PREFILL" (processing prompt), or "DECODE" (generating output)
 - `prefill_done_tokens` / `prefill_total_tokens` - Prompt processing progress
 - `decode_done_tokens` / `decode_max_tokens` - Output generation progress
 
@@ -847,6 +847,7 @@ This atomicity is maintained even in distributed deployments where API and engin
 **Direct AsyncLLM usage:**
 - ❌ No automatic sampling - `AsyncLLM` doesn't implement sampling logic
 - ✅ Manual control available - set `trace_headers={"x-vllm-journey-sampled": "1"}` on requests you want traced
+- **Important:** Header value must be exactly `"1"` (string) - any other value is treated as not sampled
 - Without the header, the engine will skip span creation (conservative behavior)
 - Useful when you want explicit control over which specific requests to trace
 
@@ -981,6 +982,10 @@ If `enable_journey_tracing=False`, no traces are created regardless of sample ra
 - `--enable-metrics` - Prometheus metrics
 - `--enable-mfu-metrics` - Model FLOPs utilization
 - `--enable-logging-iteration-details` - Detailed scheduler logs
+- Step-level tracing (advanced) - Batch summary and per-request snapshots at scheduler step level
+  - Enabled via config: `step_tracing_enabled`, `step_tracing_sample_rate`, `step_tracing_rich_subsample_rate`
+  - Emits `step.BATCH_SUMMARY` and `step.REQUEST_SNAPSHOT` events
+  - For advanced users needing scheduler-level observability
 
 **Advanced topics:**
 - Custom OTEL collector pipelines
