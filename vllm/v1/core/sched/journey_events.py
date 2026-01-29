@@ -25,7 +25,6 @@ class RequestJourneyEventType(enum.IntEnum):
     FIRST_TOKEN = 3  # First decode token produced
     PREEMPTED = 4  # Moved to PREEMPTED status
     FINISHED = 5  # Request completed (terminal state)
-    DEPARTED = 6  # Response left system (stretch goal, not yet implemented)
 
 
 class ScheduleKind(enum.IntEnum):

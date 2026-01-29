@@ -147,6 +147,8 @@ Events on the `llm_core` span:
 
 **Note on Event Names:** In OTEL traces, events appear with prefixes: API events use `api.<EVENT>` (e.g., `api.ARRIVED`, `api.DEPARTED`), and core events use `journey.<EVENT>` (e.g., `journey.QUEUED`, `journey.FINISHED`). The tables above show the event type names without prefixes for readability.
 
+**Important:** `DEPARTED` is an API layer terminal event only. The core scheduler uses `FINISHED` as its terminal event since "finished processing" is the natural terminus for the scheduler. The API layer tracks the full request lifecycle from arrival to departure, while the core layer focuses on scheduling and execution.
+
 ### Event Attributes
 
 Each event includes detailed attributes:
@@ -163,7 +165,7 @@ Each event includes detailed attributes:
 **Lifecycle:**
 - `num_preemptions` - How many times request was preempted
 - `schedule.kind` - Whether this is first schedule or resume after preemption
-- `finish.status` - Terminal status: stopped, length, aborted, error
+- `finish.status` - Terminal status: stopped, length, aborted, ignored, error
 
 ---
 
