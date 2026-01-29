@@ -275,12 +275,17 @@ def test_otel_journey_events_span_events():
 
     ts = time.monotonic()
 
-    # Create comprehensive journey events
+    # Create comprehensive journey events with exact timestamp consistency
+    # (derive float from int for exact consistency)
+    ts_ns = int(ts * 1e9)
+    ts_1_ns = int((ts + 0.1) * 1e9)
+    ts_2_ns = int((ts + 0.2) * 1e9)
+
     journey_events = [
         RequestJourneyEvent(
             request_id=request.request_id,
             event_type=RequestJourneyEventType.QUEUED,
-            ts_monotonic=ts,
+            ts_monotonic=ts_ns / 1e9,
             scheduler_step=None,
             prefill_done_tokens=0,
             prefill_total_tokens=10,
@@ -290,11 +295,12 @@ def test_otel_journey_events_span_events():
             num_preemptions_so_far=0,
             schedule_kind=None,
             finish_status=None,
+            ts_monotonic_ns=ts_ns,
         ),
         RequestJourneyEvent(
             request_id=request.request_id,
             event_type=RequestJourneyEventType.SCHEDULED,
-            ts_monotonic=ts + 0.1,
+            ts_monotonic=ts_1_ns / 1e9,
             scheduler_step=1,
             prefill_done_tokens=0,
             prefill_total_tokens=10,
@@ -304,11 +310,12 @@ def test_otel_journey_events_span_events():
             num_preemptions_so_far=0,
             schedule_kind=ScheduleKind.FIRST,
             finish_status=None,
+            ts_monotonic_ns=ts_1_ns,
         ),
         RequestJourneyEvent(
             request_id=request.request_id,
             event_type=RequestJourneyEventType.FIRST_TOKEN,
-            ts_monotonic=ts + 0.2,
+            ts_monotonic=ts_2_ns / 1e9,
             scheduler_step=2,
             prefill_done_tokens=10,
             prefill_total_tokens=10,
@@ -318,6 +325,7 @@ def test_otel_journey_events_span_events():
             num_preemptions_so_far=0,
             schedule_kind=None,
             finish_status=None,
+            ts_monotonic_ns=ts_2_ns,
         ),
     ]
 
@@ -347,7 +355,10 @@ def test_otel_journey_events_span_events():
     assert queued_call[1]["name"] == "journey.QUEUED"
     queued_attrs = queued_call[1]["attributes"]
     assert queued_attrs["event.type"] == "QUEUED"
-    assert queued_attrs["ts.monotonic"] == ts
+    assert queued_attrs["ts.monotonic"] == ts_ns / 1e9
+    assert queued_attrs["ts.monotonic_ns"] == ts_ns
+    # Verify exact consistency (integer round-trip)
+    assert int(round(queued_attrs["ts.monotonic"] * 1e9)) == queued_attrs["ts.monotonic_ns"]
     assert "scheduler.step" not in queued_attrs  # None values excluded
     assert queued_attrs["phase"] == "PREFILL"
     assert queued_attrs["prefill.done_tokens"] == 0
@@ -358,6 +369,10 @@ def test_otel_journey_events_span_events():
     assert scheduled_call[1]["name"] == "journey.SCHEDULED"
     scheduled_attrs = scheduled_call[1]["attributes"]
     assert scheduled_attrs["event.type"] == "SCHEDULED"
+    assert scheduled_attrs["ts.monotonic"] == ts_1_ns / 1e9
+    assert scheduled_attrs["ts.monotonic_ns"] == ts_1_ns
+    # Verify exact consistency (integer round-trip)
+    assert int(round(scheduled_attrs["ts.monotonic"] * 1e9)) == scheduled_attrs["ts.monotonic_ns"]
     assert scheduled_attrs["scheduler.step"] == 1
     assert scheduled_attrs["schedule.kind"] == "FIRST"
 
@@ -366,6 +381,10 @@ def test_otel_journey_events_span_events():
     assert first_token_call[1]["name"] == "journey.FIRST_TOKEN"
     first_token_attrs = first_token_call[1]["attributes"]
     assert first_token_attrs["event.type"] == "FIRST_TOKEN"
+    assert first_token_attrs["ts.monotonic"] == ts_2_ns / 1e9
+    assert first_token_attrs["ts.monotonic_ns"] == ts_2_ns
+    # Verify exact consistency (integer round-trip)
+    assert int(round(first_token_attrs["ts.monotonic"] * 1e9)) == first_token_attrs["ts.monotonic_ns"]
     assert first_token_attrs["phase"] == "DECODE"
     assert first_token_attrs["decode.done_tokens"] == 1
 
@@ -406,12 +425,16 @@ def test_otel_journey_events_with_preemption():
 
     ts = time.monotonic()
 
-    # Create journey events with preemption
+    # Create journey events with preemption and exact timestamp consistency
+    ts_ns = int(ts * 1e9)
+    ts_1_ns = int((ts + 0.1) * 1e9)
+    ts_2_ns = int((ts + 0.2) * 1e9)
+
     journey_events = [
         RequestJourneyEvent(
             request_id=request.request_id,
             event_type=RequestJourneyEventType.PREEMPTED,
-            ts_monotonic=ts,
+            ts_monotonic=ts_ns / 1e9,
             scheduler_step=5,
             prefill_done_tokens=5,
             prefill_total_tokens=10,
@@ -421,11 +444,12 @@ def test_otel_journey_events_with_preemption():
             num_preemptions_so_far=1,
             schedule_kind=None,
             finish_status=None,
+            ts_monotonic_ns=ts_ns,
         ),
         RequestJourneyEvent(
             request_id=request.request_id,
             event_type=RequestJourneyEventType.SCHEDULED,
-            ts_monotonic=ts + 0.1,
+            ts_monotonic=ts_1_ns / 1e9,
             scheduler_step=10,
             prefill_done_tokens=5,
             prefill_total_tokens=10,
@@ -435,11 +459,12 @@ def test_otel_journey_events_with_preemption():
             num_preemptions_so_far=1,
             schedule_kind=ScheduleKind.RESUME,
             finish_status=None,
+            ts_monotonic_ns=ts_1_ns,
         ),
         RequestJourneyEvent(
             request_id=request.request_id,
             event_type=RequestJourneyEventType.FINISHED,
-            ts_monotonic=ts + 0.2,
+            ts_monotonic=ts_2_ns / 1e9,
             scheduler_step=15,
             prefill_done_tokens=10,
             prefill_total_tokens=10,
@@ -449,6 +474,7 @@ def test_otel_journey_events_with_preemption():
             num_preemptions_so_far=1,
             schedule_kind=None,
             finish_status="length",
+            ts_monotonic_ns=ts_2_ns,
         ),
     ]
 
@@ -474,11 +500,19 @@ def test_otel_journey_events_with_preemption():
     preempted_call = add_event_calls[0]
     assert preempted_call[1]["name"] == "journey.PREEMPTED"
     preempted_attrs = preempted_call[1]["attributes"]
+    assert preempted_attrs["ts.monotonic"] == ts_ns / 1e9
+    assert preempted_attrs["ts.monotonic_ns"] == ts_ns
+    # Verify exact consistency (integer round-trip)
+    assert int(round(preempted_attrs["ts.monotonic"] * 1e9)) == preempted_attrs["ts.monotonic_ns"]
     assert preempted_attrs["num_preemptions"] == 1
 
     # Verify SCHEDULED with RESUME
     scheduled_call = add_event_calls[1]
     scheduled_attrs = scheduled_call[1]["attributes"]
+    assert scheduled_attrs["ts.monotonic"] == ts_1_ns / 1e9
+    assert scheduled_attrs["ts.monotonic_ns"] == ts_1_ns
+    # Verify exact consistency (integer round-trip)
+    assert int(round(scheduled_attrs["ts.monotonic"] * 1e9)) == scheduled_attrs["ts.monotonic_ns"]
     assert scheduled_attrs["schedule.kind"] == "RESUME"
     assert scheduled_attrs["num_preemptions"] == 1
 
@@ -486,6 +520,10 @@ def test_otel_journey_events_with_preemption():
     finished_call = add_event_calls[2]
     assert finished_call[1]["name"] == "journey.FINISHED"
     finished_attrs = finished_call[1]["attributes"]
+    assert finished_attrs["ts.monotonic"] == ts_2_ns / 1e9
+    assert finished_attrs["ts.monotonic_ns"] == ts_2_ns
+    # Verify exact consistency (integer round-trip)
+    assert int(round(finished_attrs["ts.monotonic"] * 1e9)) == finished_attrs["ts.monotonic_ns"]
     assert finished_attrs["finish.status"] == "length"
 
     # Verify request was removed from request_states (finished requests are cleaned up)

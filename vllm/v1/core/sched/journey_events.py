@@ -54,7 +54,7 @@ class RequestJourneyEvent(msgspec.Struct, frozen=True):
     # Identity
     request_id: str
     event_type: RequestJourneyEventType
-    ts_monotonic: float  # time.monotonic() supplied by scheduler
+    ts_monotonic: float  # time.monotonic() supplied by scheduler (float seconds)
 
     # Scheduler context (None only for QUEUED before first schedule)
     scheduler_step: int | None
@@ -73,6 +73,10 @@ class RequestJourneyEvent(msgspec.Struct, frozen=True):
     schedule_kind: ScheduleKind | None  # SCHEDULED only: FIRST or RESUME
     finish_status: Literal["stopped", "length", "aborted", "ignored",
                            "error"] | None  # FINISHED only
+
+    # Nanosecond precision timestamp (added for improved precision)
+    # Must come last as it has a default value for backward compatibility
+    ts_monotonic_ns: int = 0  # time.monotonic_ns(); 0 = legacy/absent (not valid timestamp)
 
 
 def _map_finish_status(
