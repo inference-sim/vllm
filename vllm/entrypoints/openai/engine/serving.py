@@ -397,6 +397,23 @@ class OpenAIServing:
             )
             return None
 
+        # Probabilistic sampling decision (API is authority)
+        import random
+        sample_rate = self.observability_config.journey_tracing_sample_rate
+        if random.random() >= sample_rate:
+            logger.debug(
+                "Request %s not sampled for journey tracing (sample_rate=%.3f)",
+                request_id,
+                sample_rate
+            )
+            return None
+
+        logger.debug(
+            "Request %s sampled for journey tracing (sample_rate=%.3f)",
+            request_id,
+            sample_rate
+        )
+
         logger.debug(
             "Creating API span for request %s (has_trace_headers=%s)",
             request_id,
@@ -590,6 +607,62 @@ class OpenAIServing:
                     request_id,
                     e,
                 )
+
+    def _inject_trace_context_and_sampling_header(
+        self,
+        api_span,
+        trace_headers: Mapping[str, str] | None,
+        request_id: str,
+    ) -> dict[str, str]:
+        """Inject trace context and add vLLM journey sampling header.
+
+        Centralized helper to:
+        1. Inject W3C Trace Context (traceparent/tracestate) from API span
+        2. Add x-vllm-journey-sampled header to signal API sampling decision
+
+        This ensures trace_headers is always a mutable dict and header injection
+        is consistent across all endpoints.
+
+        Args:
+            api_span: The API span whose context should be injected
+            trace_headers: Optional trace headers dict (will be created if None)
+            request_id: Request ID for logging
+
+        Returns:
+            Dict with both W3C trace context and vLLM sampling header
+        """
+        try:
+            from vllm.tracing import inject_trace_context, VLLM_JOURNEY_SAMPLED_HEADER
+
+            # Normalize to mutable dict (handles None and immutable Mapping)
+            carrier = dict(trace_headers or {})
+
+            # Inject W3C trace context (modifies dict in place)
+            result = inject_trace_context(api_span, carrier)
+
+            # inject_trace_context returns the carrier dict (or None in edge cases)
+            # Use the result if available, otherwise use original carrier
+            if result is not None:
+                carrier = result
+
+            # Add vLLM sampling decision header
+            carrier[VLLM_JOURNEY_SAMPLED_HEADER] = "1"
+
+            logger.debug(
+                "Injected trace context and sampling header for request %s",
+                request_id
+            )
+
+            return carrier
+        except Exception as e:
+            # Injection failure should not break request processing
+            logger.debug(
+                "Failed to inject trace context/header for request %s: %s",
+                request_id,
+                e
+            )
+            # Return empty dict on failure to maintain consistent type
+            return {}
 
     def _get_tool_parser(
         self, tool_parser_name: str | None = None, enable_auto_tools: bool = False
@@ -1066,20 +1139,12 @@ class OpenAIServing:
                         arrival_time = time.monotonic()
                         self._store_api_span(ctx.request_id, api_span, arrival_time)
 
-                        # Inject API span context into trace_headers for parent-child linkage
-                        try:
-                            from vllm.tracing import inject_trace_context
-                            trace_headers = inject_trace_context(api_span, trace_headers)
-                            logger.debug(
-                                "Injected API span context into trace_headers for request %s",
-                                ctx.request_id,
-                            )
-                        except Exception as e:
-                            logger.debug(
-                                "Failed to inject API span context for request %s: %s",
-                                ctx.request_id,
-                                e,
-                            )
+                        # Inject API span context and sampling header for parent-child linkage
+                        # This enables the scheduler to create core span as child of API span
+                        # and signals the API sampling decision
+                        trace_headers = self._inject_trace_context_and_sampling_header(
+                            api_span, trace_headers, ctx.request_id
+                        )
 
             pooling_params = self._create_pooling_params(ctx)
             if isinstance(pooling_params, ErrorResponse):

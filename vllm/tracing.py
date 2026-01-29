@@ -8,6 +8,7 @@ from vllm.logger import init_logger
 from vllm.utils.func_utils import run_once
 
 TRACE_HEADERS = ["traceparent", "tracestate"]
+VLLM_JOURNEY_SAMPLED_HEADER = "x-vllm-journey-sampled"  # vLLM-specific sampling decision
 
 logger = init_logger(__name__)
 

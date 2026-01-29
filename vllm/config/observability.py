@@ -98,6 +98,13 @@ class ObservabilityConfig:
     Default 0.001 = 0.1% of steps get detailed per-request data. Only applies when
     step_tracing_enabled is True AND the step is batch-summary-sampled."""
 
+    journey_tracing_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
+    """Sampling rate for journey tracing. Range [0.0, 1.0].
+    Default 1.0 = 100% (no sampling, backward compatible).
+    When < 1.0, API layer makes probabilistic sampling decision per request.
+    Sampling is end-to-end atomic: both API span + engine span created or neither.
+    Independent of OTEL traceparent sampled bit."""
+
     @cached_property
     def collect_model_forward_time(self) -> bool:
         """Whether to collect model forward time for the request."""
