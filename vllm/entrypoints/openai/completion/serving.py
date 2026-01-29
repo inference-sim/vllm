@@ -319,53 +319,95 @@ class OpenAIServingCompletion(OpenAIServing):
         # Non-streaming response
         final_res_batch: list[RequestOutput | None] = [None] * num_prompts
         try:
-            async for i, res in result_generator:
-                final_res_batch[i] = res
+            try:
+                async for i, res in result_generator:
+                    final_res_batch[i] = res
 
-            for i, final_res in enumerate(final_res_batch):
-                assert final_res is not None
+                for i, final_res in enumerate(final_res_batch):
+                    assert final_res is not None
 
-                # The output should contain the input text
-                # We did not pass it into vLLM engine to avoid being redundant
-                # with the inputs token IDs
-                if final_res.prompt is None:
-                    engine_prompt = engine_prompts[i]
-                    final_res.prompt = (
-                        None
-                        if is_embeds_prompt(engine_prompt)
-                        else engine_prompt.get("prompt")
-                    )
+                    # The output should contain the input text
+                    # We did not pass it into vLLM engine to avoid being redundant
+                    # with the inputs token IDs
+                    if final_res.prompt is None:
+                        engine_prompt = engine_prompts[i]
+                        final_res.prompt = (
+                            None
+                            if is_embeds_prompt(engine_prompt)
+                            else engine_prompt.get("prompt")
+                        )
 
-            final_res_batch_checked = cast(list[RequestOutput], final_res_batch)
+                final_res_batch_checked = cast(list[RequestOutput], final_res_batch)
 
-            response = self.request_output_to_completion_response(
-                final_res_batch_checked,
-                request,
+                response = self.request_output_to_completion_response(
+                    final_res_batch_checked,
+                    request,
+                    request_id,
+                    created_time,
+                    model_name,
+                    tokenizer,
+                    request_metadata,
+                )
+            except asyncio.CancelledError:
+                # Client disconnected - finalize and return error
+                self._finalize_api_span(
+                    request_id,
+                    terminal_event="ABORTED",
+                    reason="client_disconnect",
+                    error_message="Client disconnected",
+                )
+                return self.create_error_response("Client disconnected")
+            except GenerationError as e:
+                # Generation error - finalize and return error
+                self._finalize_api_span(
+                    request_id,
+                    terminal_event="ABORTED",
+                    reason="generation_error",
+                    error_message=str(e),
+                )
+                return self._convert_generation_error_to_response(e)
+            except ValueError as e:
+                # Validation error - finalize and return error
+                self._finalize_api_span(
+                    request_id,
+                    terminal_event="ABORTED",
+                    reason="validation_error",
+                    error_message=str(e),
+                )
+                return self.create_error_response(e)
+
+            # When user requests streaming but we don't stream, we still need to
+            # return a streaming response with a single event.
+            if request.stream:
+                response_json = response.model_dump_json()
+
+                async def fake_stream_generator() -> AsyncGenerator[str, None]:
+                    try:
+                        yield f"data: {response_json}\n\n"
+                        # SUCCESS: Finalize with DEPARTED before [DONE]
+                        self._finalize_api_span(
+                            request_id,
+                            terminal_event="DEPARTED",
+                        )
+                        yield "data: [DONE]\n\n"
+                    finally:
+                        # CRITICAL: Unconditional cleanup-only in finally
+                        # Called with terminal_event=None: no event emission, just end+cleanup if not already done
+                        self._finalize_api_span(request_id)
+
+                return fake_stream_generator()
+
+            # SUCCESS: Non-streaming response complete, finalize with DEPARTED
+            self._finalize_api_span(
                 request_id,
-                created_time,
-                model_name,
-                tokenizer,
-                request_metadata,
+                terminal_event="DEPARTED",
             )
-        except asyncio.CancelledError:
-            return self.create_error_response("Client disconnected")
-        except GenerationError as e:
-            return self._convert_generation_error_to_response(e)
-        except ValueError as e:
-            return self.create_error_response(e)
-
-        # When user requests streaming but we don't stream, we still need to
-        # return a streaming response with a single event.
-        if request.stream:
-            response_json = response.model_dump_json()
-
-            async def fake_stream_generator() -> AsyncGenerator[str, None]:
-                yield f"data: {response_json}\n\n"
-                yield "data: [DONE]\n\n"
-
-            return fake_stream_generator()
-
-        return response
+            return response
+        finally:
+            # CRITICAL: Unconditional cleanup-only in outer finally
+            # Called with terminal_event=None: no event emission, just end+cleanup if not already done
+            # This is fallback for any truly uncaught exceptions
+            self._finalize_api_span(request_id)
 
     async def completion_stream_generator(
         self,
