@@ -1338,11 +1338,11 @@ def test_request_finish_metrics_completeness():
     - Test uses mock values where both domains appear comparable (1000.0 vs 1100+)
     - DO NOT compare arrival_time with monotonic timestamps in production code
 
-    Semantic note on first_token_ts:
-    - Despite the name, first_token_ts means "first prefill update timestamp"
-    - Set on first update_from_output() call while is_prefilling=True (stats.py:288)
-    - Does NOT check whether tokens were actually generated (no condition on new_token_ids)
-    - In this test: set to 1100.0 in step 1 (new_token_ids=[]), NOT 1150.0 in step 2 (first token)
+    Note on first_token_ts definition:
+    - Currently defined as "first prefill update timestamp" (stats.py:288)
+    - Set on first update_from_output() call while is_prefilling=True
+    - Condition checks is_prefilling flag only (no check on new_token_ids length)
+    - In this test: captured at step 1 (1100.0, new_token_ids=[]), not step 2 (first token [42])
     """
     output_processor = OutputProcessor(tokenizer=None, log_stats=True)
 
@@ -1431,9 +1431,8 @@ def test_request_finish_metrics_completeness():
     assert metrics.queued_ts == 1100.0
     assert metrics.scheduled_ts == 1150.0
     # first_token_ts: set on FIRST update_from_output while is_prefilling=True (stats.py:288)
-    # NOTE: Semantic confusion - "first_token_ts" doesn't mean "first token generated"
-    #       but rather "first prefill update timestamp" (even if new_token_ids=[])
-    assert metrics.first_token_ts == 1100.0  # Step 1 (empty tokens), NOT step 2 (first token [42])
+    # NOTE: Currently defined as "first prefill update timestamp" (regardless of token emission)
+    assert metrics.first_token_ts == 1100.0  # Step 1 (new_token_ids=[]), not step 2 (first token)
     assert metrics.last_token_ts == 1170.0   # Set from engine_core_timestamp in step 4
 
     # Verify timing invariants (monotonic ordering must hold)
