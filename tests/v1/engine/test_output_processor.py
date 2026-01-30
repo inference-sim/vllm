@@ -1128,11 +1128,14 @@ def test_lora_request_tracking(log_stats: bool, dummy_test_vectors):
 
 
 def test_journey_events_populate_prometheus_timestamps():
-    """Test that EngineCoreOutput timestamps correctly populate queued_ts and scheduled_ts
-    for Prometheus metrics, remaining stable across preemption/resume.
+    """Test first-write-wins timestamp propagation from EngineCoreOutput to RequestState.stats.
 
-    NOTE: Post-PR#9, timestamps come from EngineCoreOutput.queued_ts/scheduled_ts fields
-    (populated by scheduler), NOT from journey_events parameter (which is deprecated).
+    Contract (output_processor.py:535,537): OutputProcessor copies queued_ts/scheduled_ts IFF:
+    - Source (EngineCoreOutput) value > 0.0 (non-sentinel)
+    - Destination (RequestState.stats) value == 0.0 (unset sentinel)
+
+    Verifies timestamps remain stable across preemption/resume (no overwrites).
+    Post-PR#9: Timestamps flow via EngineCoreOutput fields, not journey_events parameter.
     """
 
     # Create minimal OutputProcessor without tokenizer dependency
@@ -1169,6 +1172,7 @@ def test_journey_events_populate_prometheus_timestamps():
     from vllm.v1.engine import EngineCoreOutput
 
     # Iteration 1: QUEUED - timestamp from EngineCoreOutput.queued_ts
+    # Document copy conditions (sensitivity: if > 0.0 check removed, copy fails)
     output_1 = EngineCoreOutput(
         request_id=request_id,
         new_token_ids=[100],
@@ -1239,7 +1243,8 @@ def test_timestamp_propagation_batch_processing():
 
     Why integration test (not unit):
     - Tests OutputProcessor batch coordination: multiple requests with different
-      timestamps processed together must maintain isolation
+      timestamps processed together must maintain isolation (each request's stats
+      contain only its own timestamps, no cross-contamination between requests)
     - Verifies cross-component boundary contract (EngineCoreOutput fields → stats)
     - Unit tests verify single-request behavior; this verifies batch correctness
 
@@ -1326,6 +1331,12 @@ def test_request_finish_metrics_completeness():
     Architecture tested:
     EngineCoreOutput (finish_reason set) → OutputProcessor (finalizes metrics) →
     RequestOutput (exposes metrics to API)
+
+    Clock domains (verified from code):
+    - arrival_time: wall-clock (time.time()) from input_processor.py:477
+    - queued_ts, scheduled_ts, first_token_ts, last_token_ts: monotonic (time.monotonic())
+    - Test uses mock values where both domains appear comparable (1000.0 vs 1100+)
+    - DO NOT compare arrival_time with monotonic timestamps in production code
     """
     output_processor = OutputProcessor(tokenizer=None, log_stats=True)
 
@@ -1409,17 +1420,30 @@ def test_request_finish_metrics_completeness():
     assert request_output.metrics is not None, "Metrics should be populated"
     metrics = request_output.metrics
 
-    # Verify timing metrics
+    # Verify timing metrics (exact values from deterministic test inputs)
     assert metrics.arrival_time == arrival_time
     assert metrics.queued_ts == 1100.0
     assert metrics.scheduled_ts == 1150.0
-    assert metrics.first_token_ts > 0.0
-    assert metrics.last_token_ts > 0.0
+    # first_token_ts set on first update_from_output call while is_prefilling=True (step 1)
+    assert metrics.first_token_ts == 1100.0  # Set from engine_core_timestamp in step 1
+    assert metrics.last_token_ts == 1170.0   # Set from engine_core_timestamp in step 4
+
+    # Verify timing invariants (monotonic ordering must hold)
+    assert metrics.queued_ts <= metrics.scheduled_ts
+    assert metrics.first_token_ts <= metrics.last_token_ts
 
     # Verify token count metrics
     assert metrics.num_generation_tokens == 4  # 4 tokens generated (42, 43, 44, 45)
 
-    # Verify request was cleaned up after finish
+    # CRITICAL: Verify finish_reason propagates end-to-end (API contract)
+    # FinishReason.LENGTH enum (value=1) is converted to string "length" via __str__
+    assert len(request_output.outputs) == 1
+    assert request_output.outputs[0].finish_reason == "length"
+    assert request_output.finished is True
+
+    # Verify request cleanup (leak-guard invariant)
+    # When finish_reason is not None, OutputProcessor MUST remove request from internal state
+    # (guaranteed by output_processor.py:587 unconditional pop)
     assert "request-finish-int" not in output_processor.request_states
 
 
