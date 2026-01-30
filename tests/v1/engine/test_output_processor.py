@@ -26,11 +26,6 @@ from vllm.v1.engine import (
 )
 from vllm.v1.engine.output_processor import OutputProcessor, RequestOutputCollector
 from vllm.v1.metrics.stats import IterationStats, SchedulerStats
-from vllm.v1.core.sched.journey_events import (
-    RequestJourneyEvent,
-    RequestJourneyEventType,
-    ScheduleKind,
-)
 
 
 def _ref_convert_id_to_token(
@@ -1133,8 +1128,12 @@ def test_lora_request_tracking(log_stats: bool, dummy_test_vectors):
 
 
 def test_journey_events_populate_prometheus_timestamps():
-    """Test that journey events correctly populate queued_ts and scheduled_ts
-    for Prometheus metrics, remaining stable across preemption/resume."""
+    """Test that EngineCoreOutput timestamps correctly populate queued_ts and scheduled_ts
+    for Prometheus metrics, remaining stable across preemption/resume.
+
+    NOTE: Post-PR#9, timestamps come from EngineCoreOutput.queued_ts/scheduled_ts fields
+    (populated by scheduler), NOT from journey_events parameter (which is deprecated).
+    """
 
     # Create minimal OutputProcessor without tokenizer dependency
     output_processor = OutputProcessor(
@@ -1167,125 +1166,61 @@ def test_journey_events_populate_prometheus_timestamps():
     assert req_state.stats.queued_ts == 0.0
     assert req_state.stats.scheduled_ts == 0.0
 
-    # Iteration 1: QUEUED event
-    journey_events_queued = [
-        RequestJourneyEvent(
-            request_id=request_id,
-            event_type=RequestJourneyEventType.QUEUED,
-            ts_monotonic=100.0,
-            scheduler_step=None,
-            prefill_done_tokens=0,
-            prefill_total_tokens=len(prompt_tokens),
-            decode_done_tokens=0,
-            decode_max_tokens=10,
-            phase="PREFILL",
-            num_preemptions_so_far=0,
-            schedule_kind=None,
-            finish_status=None,
-        ),
-    ]
-
     from vllm.v1.engine import EngineCoreOutput
 
+    # Iteration 1: QUEUED - timestamp from EngineCoreOutput.queued_ts
     output_1 = EngineCoreOutput(
         request_id=request_id,
         new_token_ids=[100],
+        queued_ts=100.0,  # Scheduler sets this when request queued
     )
 
-    output_processor.process_outputs([output_1], journey_events=journey_events_queued)
+    output_processor.process_outputs([output_1])
 
     # Verify queued_ts set, scheduled_ts still unset
     assert req_state.stats.queued_ts == 100.0
     assert req_state.stats.scheduled_ts == 0.0
 
-    # Iteration 2: SCHEDULED event (first time)
-    journey_events_scheduled = [
-        RequestJourneyEvent(
-            request_id=request_id,
-            event_type=RequestJourneyEventType.SCHEDULED,
-            ts_monotonic=150.0,
-            scheduler_step=1,
-            prefill_done_tokens=0,
-            prefill_total_tokens=len(prompt_tokens),
-            decode_done_tokens=0,
-            decode_max_tokens=10,
-            phase="PREFILL",
-            num_preemptions_so_far=0,
-            schedule_kind=ScheduleKind.FIRST,
-            finish_status=None,
-        ),
-    ]
-
+    # Iteration 2: SCHEDULED - timestamp from EngineCoreOutput.scheduled_ts
     output_2 = EngineCoreOutput(
         request_id=request_id,
         new_token_ids=[101],
+        queued_ts=100.0,
+        scheduled_ts=150.0,  # Scheduler sets this on first schedule
     )
 
-    output_processor.process_outputs(
-        [output_2], journey_events=journey_events_scheduled
-    )
+    output_processor.process_outputs([output_2])
 
     # Verify both timestamps now set
     assert req_state.stats.queued_ts == 100.0
     assert req_state.stats.scheduled_ts == 150.0
 
-    # Iteration 3: PREEMPTED event
-    journey_events_preempted = [
-        RequestJourneyEvent(
-            request_id=request_id,
-            event_type=RequestJourneyEventType.PREEMPTED,
-            ts_monotonic=160.0,
-            scheduler_step=2,
-            prefill_done_tokens=3,
-            prefill_total_tokens=len(prompt_tokens),
-            decode_done_tokens=0,
-            decode_max_tokens=10,
-            phase="PREFILL",
-            num_preemptions_so_far=1,
-            schedule_kind=None,
-            finish_status=None,
-        ),
-    ]
-
+    # Iteration 3: PREEMPTED - timestamps unchanged
     output_3 = EngineCoreOutput(
         request_id=request_id,
         new_token_ids=[102],
+        queued_ts=100.0,
+        scheduled_ts=150.0,
     )
 
-    output_processor.process_outputs(
-        [output_3], journey_events=journey_events_preempted
-    )
+    output_processor.process_outputs([output_3])
 
     # Verify timestamps unchanged after preemption
     assert req_state.stats.queued_ts == 100.0
     assert req_state.stats.scheduled_ts == 150.0
 
-    # Iteration 4: SCHEDULED event (resume after preemption)
-    journey_events_resume = [
-        RequestJourneyEvent(
-            request_id=request_id,
-            event_type=RequestJourneyEventType.SCHEDULED,
-            ts_monotonic=200.0,  # New timestamp (later time)
-            scheduler_step=3,
-            prefill_done_tokens=3,
-            prefill_total_tokens=len(prompt_tokens),
-            decode_done_tokens=0,
-            decode_max_tokens=10,
-            phase="PREFILL",
-            num_preemptions_so_far=1,
-            schedule_kind=ScheduleKind.RESUME,
-            finish_status=None,
-        ),
-    ]
-
+    # Iteration 4: SCHEDULED (resume) - scheduled_ts NOT overwritten
     output_4 = EngineCoreOutput(
         request_id=request_id,
         new_token_ids=[103],
+        queued_ts=100.0,
+        scheduled_ts=200.0,  # Scheduler attempts to set new timestamp
     )
 
-    output_processor.process_outputs([output_4], journey_events=journey_events_resume)
+    output_processor.process_outputs([output_4])
 
-    # CRITICAL: Verify timestamps were NOT overwritten by resume
+    # CRITICAL: Verify scheduled_ts was NOT overwritten by resume
+    # (OutputProcessor only copies timestamps if currently 0.0)
     assert req_state.stats.queued_ts == 100.0  # Still original
     assert req_state.stats.scheduled_ts == 150.0  # Still original (NOT 200.0)
 
@@ -1293,6 +1228,199 @@ def test_journey_events_populate_prometheus_timestamps():
     queued_time = req_state.stats.scheduled_ts - req_state.stats.queued_ts
     assert queued_time == 50.0  # 150.0 - 100.0
     assert queued_time > 0  # Sanity check: positive delta
+
+
+def test_timestamp_propagation_batch_processing():
+    """Integration test: Verify timestamp propagation for multiple concurrent requests.
+
+    This test verifies the NEW post-PR#9 cross-component wiring where timestamps
+    flow from EngineCoreOutput → OutputProcessor → RequestState.stats for multiple
+    requests in a single batch.
+
+    Why integration test (not unit):
+    - Tests OutputProcessor batch coordination: multiple requests with different
+      timestamps processed together must maintain isolation
+    - Verifies cross-component boundary contract (EngineCoreOutput fields → stats)
+    - Unit tests verify single-request behavior; this verifies batch correctness
+
+    Architecture tested:
+    Scheduler (sets timestamps) → EngineCoreOutput (carries timestamps) →
+    OutputProcessor (copies to stats) → maintains per-request isolation
+    """
+    output_processor = OutputProcessor(tokenizer=None, log_stats=True)
+
+    # Create 3 requests with different timestamps
+    requests = []
+    for i in range(3):
+        request = EngineCoreRequest(
+            request_id=f"request-{i}-int",
+            external_req_id=f"request-{i}",
+            prompt_token_ids=[1, 2, 3],
+            mm_features=None,
+            eos_token_id=None,
+            arrival_time=float(i),
+            lora_request=None,
+            cache_salt=None,
+            data_parallel_rank=None,
+            sampling_params=SamplingParams(),
+            pooling_params=None,
+        )
+        output_processor.add_request(request, None)
+        requests.append(request)
+
+    from vllm.v1.engine import EngineCoreOutput
+
+    # Batch 1: All requests queued at different times
+    outputs_batch_1 = [
+        EngineCoreOutput(
+            request_id=f"request-{i}-int",
+            new_token_ids=[100 + i],
+            queued_ts=100.0 + i * 10,  # 100.0, 110.0, 120.0
+        )
+        for i in range(3)
+    ]
+    output_processor.process_outputs(outputs_batch_1)
+
+    # Verify each request has correct queued_ts (isolation maintained)
+    for i in range(3):
+        req_state = output_processor.request_states[f"request-{i}-int"]
+        assert req_state.stats.queued_ts == 100.0 + i * 10
+        assert req_state.stats.scheduled_ts == 0.0  # Not scheduled yet
+
+    # Batch 2: All requests scheduled at different times
+    outputs_batch_2 = [
+        EngineCoreOutput(
+            request_id=f"request-{i}-int",
+            new_token_ids=[200 + i],
+            queued_ts=100.0 + i * 10,  # Unchanged
+            scheduled_ts=150.0 + i * 5,  # 150.0, 155.0, 160.0
+        )
+        for i in range(3)
+    ]
+    output_processor.process_outputs(outputs_batch_2)
+
+    # Verify each request maintains correct timestamps
+    for i in range(3):
+        req_state = output_processor.request_states[f"request-{i}-int"]
+        assert req_state.stats.queued_ts == 100.0 + i * 10
+        assert req_state.stats.scheduled_ts == 150.0 + i * 5
+
+        # Verify per-request queue time is correct
+        queue_time = req_state.stats.scheduled_ts - req_state.stats.queued_ts
+        expected_queue_time = (150.0 + i * 5) - (100.0 + i * 10)
+        assert queue_time == expected_queue_time
+
+
+def test_request_finish_metrics_completeness():
+    """Integration test: Verify RequestOutput.metrics is complete when request finishes.
+
+    This test verifies the NEW post-PR#9 finish flow where complete metrics are
+    collected and exposed through the API when a request completes.
+
+    Why integration test (not unit):
+    - Tests the finish trigger mechanism: EngineCore signals finish → OutputProcessor
+      computes final metrics → RequestOutput exposes to API
+    - Verifies cross-component coordination (finish reason propagation, metrics finalization)
+    - Unit tests verify individual metric calculations; this verifies end-to-end flow
+
+    Architecture tested:
+    EngineCoreOutput (finish_reason set) → OutputProcessor (finalizes metrics) →
+    RequestOutput (exposes metrics to API)
+    """
+    output_processor = OutputProcessor(tokenizer=None, log_stats=True)
+
+    # Create request
+    arrival_time = 1000.0
+    request = EngineCoreRequest(
+        request_id="request-finish-int",
+        external_req_id="request-finish",
+        prompt_token_ids=[1, 2, 3, 4, 5],  # 5 prompt tokens
+        mm_features=None,
+        eos_token_id=None,
+        arrival_time=arrival_time,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+        sampling_params=SamplingParams(),
+        pooling_params=None,
+    )
+    output_processor.add_request(request, None)
+
+    from vllm.v1.engine import EngineCoreOutput
+    from vllm.v1.metrics.stats import IterationStats
+
+    # Step 1: Queued
+    output_1 = EngineCoreOutput(
+        request_id="request-finish-int",
+        new_token_ids=[],
+        queued_ts=1100.0,
+    )
+    output_processor.process_outputs(
+        [output_1],
+        engine_core_timestamp=1100.0,
+        iteration_stats=IterationStats(),
+    )
+
+    # Step 2: Scheduled and first token
+    output_2 = EngineCoreOutput(
+        request_id="request-finish-int",
+        new_token_ids=[42],
+        queued_ts=1100.0,
+        scheduled_ts=1150.0,
+    )
+    output_processor.process_outputs(
+        [output_2],
+        engine_core_timestamp=1150.0,
+        iteration_stats=IterationStats(),
+    )
+
+    # Step 3: Generate more tokens
+    output_3 = EngineCoreOutput(
+        request_id="request-finish-int",
+        new_token_ids=[43, 44],
+        queued_ts=1100.0,
+        scheduled_ts=1150.0,
+    )
+    output_processor.process_outputs(
+        [output_3],
+        engine_core_timestamp=1160.0,
+        iteration_stats=IterationStats(),
+    )
+
+    # Step 4: Finish
+    output_4 = EngineCoreOutput(
+        request_id="request-finish-int",
+        new_token_ids=[45],
+        queued_ts=1100.0,
+        scheduled_ts=1150.0,
+        finish_reason=FinishReason.LENGTH,
+    )
+    result = output_processor.process_outputs(
+        [output_4],
+        engine_core_timestamp=1170.0,
+        iteration_stats=IterationStats(),
+    )
+
+    # Verify RequestOutput was produced
+    assert len(result.request_outputs) == 1
+    request_output = result.request_outputs[0]
+
+    # Verify metrics are complete
+    assert request_output.metrics is not None, "Metrics should be populated"
+    metrics = request_output.metrics
+
+    # Verify timing metrics
+    assert metrics.arrival_time == arrival_time
+    assert metrics.queued_ts == 1100.0
+    assert metrics.scheduled_ts == 1150.0
+    assert metrics.first_token_ts > 0.0
+    assert metrics.last_token_ts > 0.0
+
+    # Verify token count metrics
+    assert metrics.num_generation_tokens == 4  # 4 tokens generated (42, 43, 44, 45)
+
+    # Verify request was cleaned up after finish
+    assert "request-finish-int" not in output_processor.request_states
 
 
 @pytest.mark.asyncio
