@@ -262,6 +262,7 @@ class OpenAIServing:
         self.renderer = self.models.renderer
         self.model_config = self.models.model_config
         self.max_model_len = self.model_config.max_model_len
+        self.observability_config = engine_client.vllm_config.observability_config
 
         # NEW: Track API spans separately (not in Pydantic model to avoid serialization)
         # Maps request_id → (span, arrival_time, first_response_time)
