@@ -4,6 +4,17 @@
 ARG VLLM_BASE_VERSION=v0.14.1
 FROM vllm/vllm-openai:${VLLM_BASE_VERSION}
 
+# Install OpenTelemetry deps early so it stays cached across code changes
+RUN python3 -m pip install --no-cache-dir --prefer-binary \
+    opentelemetry-sdk==1.26.0 \
+    opentelemetry-api==1.26.0 \
+    opentelemetry-exporter-otlp==1.26.0 \
+    python-json-logger==2.0.7 \
+    opentelemetry-semantic-conventions-ai==0.4.1
+
+# Fail fast during build if deps aren't importable
+RUN python3 -c "import opentelemetry.sdk; import opentelemetry.exporter.otlp.proto.http.trace_exporter"
+
 # Find where vLLM is installed in the base image
 RUN VLLM_LOCATION=$(python3 -c "import vllm; import os; print(os.path.dirname(vllm.__file__))") && \
     echo "vLLM installed at: $VLLM_LOCATION" && \
@@ -18,11 +29,6 @@ RUN VLLM_LOCATION=$(cat /tmp/vllm_location.txt) && \
     cp -r /tmp/vllm-fork/* "$VLLM_LOCATION/" && \
     rm -rf /tmp/vllm-fork && \
     echo "Overlaid fork Python code at $VLLM_LOCATION"
-
-# Labels for your fork
-LABEL org.opencontainers.image.source="https://github.com/inference-sim/vllm"
-LABEL org.opencontainers.image.description="vLLM fork with journey tracing (inference-sim)"
-LABEL org.opencontainers.image.vendor="inference-sim"
 
 # Keep the same entrypoint as vLLM
 ENTRYPOINT ["vllm", "serve"]
