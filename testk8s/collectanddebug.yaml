@@ -27,7 +27,7 @@ spec:
 
       containers:
         - name: vllm
-          image: ghcr.io/inference-sim/vllm:0.4.5
+          image: ghcr.io/inference-sim/vllm:0.4.6
           imagePullPolicy: IfNotPresent
 
           resources:
