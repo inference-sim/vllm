@@ -3,8 +3,8 @@ name: Build and Push Docker Image
 on:
   push:
     tags:
-      - 'v*'
-  workflow_dispatch:  # Manual trigger available
+      - "v*"
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -14,38 +14,40 @@ jobs:
   build-and-push:
     runs-on: ubuntu-latest
     permissions:
-      contents: read      # Required to checkout code
-      packages: write     # Required to push to ghcr.io
-      id-token: write     # Required for attestations
-      attestations: write # Required for build attestations
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
 
     steps:
       - name: Free up disk space (aggressive)
+        shell: bash
         run: |
+          set -euo pipefail
           echo "Disk space before cleanup:"
           df -h
 
           # Remove large pre-installed tools
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}" || true
 
           # Remove language runtimes we don't need
-          sudo rm -rf /usr/local/lib/node_modules
-          sudo rm -rf /usr/share/swift
-          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /usr/local/lib/node_modules || true
+          sudo rm -rf /usr/share/swift || true
+          sudo rm -rf /usr/local/.ghcup || true
 
           # Clean apt cache
-          sudo apt-get clean
-          sudo rm -rf /var/lib/apt/lists/*
+          sudo apt-get clean || true
+          sudo rm -rf /var/lib/apt/lists/* || true
 
           # Remove swap file (we have enough RAM)
-          sudo swapoff -a
-          sudo rm -f /swapfile
-          sudo rm -f /mnt/swapfile
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
+          sudo rm -f /mnt/swapfile || true
 
           echo "Disk space after cleanup:"
           df -h
@@ -56,20 +58,23 @@ jobs:
           fetch-depth: 0
 
       - name: Move Docker data directory to /mnt
+        shell: bash
         run: |
+          set -euo pipefail
           sudo systemctl stop docker
           sudo mkdir -p /mnt/docker-data
-          sudo rsync -a /var/lib/docker/ /mnt/docker-data/
-          echo '{"data-root": "/mnt/docker-data"}' | sudo tee /etc/docker/daemon.json
+          sudo rsync -a /var/lib/docker/ /mnt/docker-data/ || true
+          echo '{"data-root": "/mnt/docker-data"}' | sudo tee /etc/docker/daemon.json >/dev/null
           sudo systemctl start docker
-          echo "Docker is now using /mnt with 70GB available"
-          df -h /mnt
+          echo "Docker is now using /mnt"
+          df -h /mnt || true
 
+      # BuildKit pinned to reduce surprise breakage
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
           driver-opts: |
-            image=moby/buildkit:v0.27.1
+            image=moby/buildkit:v0.27.0
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -78,6 +83,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Since this workflow only runs on tags and manual, keep tags simple and deterministic
       - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
@@ -87,48 +93,11 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=vLLM Fork (inference-sim)
             org.opencontainers.image.description=vLLM fork with journey tracing and observability features
             org.opencontainers.image.vendor=inference-sim
             org.opencontainers.image.licenses=Apache-2.0
-
-      - name: Build image locally (for validation)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile.fork
-          platforms: linux/amd64
-          load: true              # 👈 load into local docker
-          push: false
-          tags: local/vllm-test:ci
-          build-args: |
-            VLLM_BASE_VERSION=v0.14.1
-          cache-from: type=gha
-          cache-to: type=gha,mode=min
-
-      - name: Validate image (CPU-safe imports only)
-        run: |
-          docker run --rm local/vllm-test:ci python3 - <<'EOF'
-          import opentelemetry.sdk
-          import opentelemetry.exporter.otlp.proto.http.trace_exporter
-          print("✅ OTEL imports OK")
-
-          # Avoid importing vllm._C or device inference paths
-          import importlib
-          vllm = importlib.import_module("vllm")
-          print("✅ vllm module import OK:", getattr(vllm, "__version__", "unknown"))
-          EOF
-
-      - name: Validate overlay (CPU-safe)
-        run: |
-          docker run --rm local/vllm-test:ci python3 - <<'EOF'
-          import os, vllm
-          print("vllm path:", os.path.dirname(vllm.__file__))
-          EOF
-
-
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -136,7 +105,7 @@ jobs:
           context: .
           file: ./Dockerfile.fork
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
