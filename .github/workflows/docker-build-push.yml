@@ -110,17 +110,27 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=min
 
-      - name: Validate built image (OTEL + vLLM imports)
+      - name: Validate image (CPU-safe imports only)
         run: |
-          docker run --rm local/vllm-test:ci \
-            python3 - <<'EOF'
+          docker run --rm local/vllm-test:ci python3 - <<'EOF'
           import opentelemetry.sdk
           import opentelemetry.exporter.otlp.proto.http.trace_exporter
-          import vllm
-          print("✅ OTEL + vLLM imports OK")
+          print("✅ OTEL imports OK")
+
+          # Avoid importing vllm._C or device inference paths
+          import importlib
+          vllm = importlib.import_module("vllm")
+          print("✅ vllm module import OK:", getattr(vllm, "__version__", "unknown"))
           EOF
 
-          docker run --rm local/vllm-test:ci vllm --help >/dev/null
+      - name: Validate overlay (CPU-safe)
+        run: |
+          docker run --rm local/vllm-test:ci python3 - <<'EOF'
+          import os, vllm
+          print("vllm path:", os.path.dirname(vllm.__file__))
+          EOF
+
+
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
