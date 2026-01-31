@@ -183,6 +183,15 @@ class Scheduler(SchedulerInterface):
         # Injectable rich sampler (same signature as step sampler)
         self._rich_sampler: Any = lambda step_id, rate: random.random() < rate
 
+        # Step tracing span lifecycle control
+        self._closure_interval_steps: int = (
+            self.observability_config.step_tracing_closure_interval
+        )
+        self._steps_since_last_closure: int = 0
+        self._events_emitted_since_last_closure: bool = False
+        self._step_span_sequence: int = 0  # Increments with each new span
+        self._step_span_range_start: int = 1  # First step in current span
+
         if self._enable_step_tracing:
             if endpoint is None:
                 # Explicitly disable step tracing if no OTEL endpoint configured
@@ -210,17 +219,13 @@ class Scheduler(SchedulerInterface):
                     )
                     self._enable_step_tracing = False
 
-            # Create long-lived scheduler_steps span
+            # Create initial scheduler_steps span
             if self._enable_step_tracing and self.step_tracer is not None:
                 try:
-                    from vllm.tracing import SpanKind
-                    self._step_span = self.step_tracer.start_span(
-                        "scheduler_steps",
-                        kind=SpanKind.INTERNAL,
-                    )
+                    self._open_step_span(step_range_start=1)
                 except Exception as e:
                     logger.warning(
-                        "Failed to create scheduler_steps span: %s", e
+                        "Failed to create initial scheduler_steps span: %s", e
                     )
                     self._enable_step_tracing = False
 
@@ -541,6 +546,84 @@ class Scheduler(SchedulerInterface):
         except Exception as e:
             # Tracing failures must not crash the scheduler
             logger.debug("Failed to emit rich request snapshots: %s", e)
+
+    def _open_step_span(self, step_range_start: int) -> None:
+        """Open a new scheduler_steps span for step tracing.
+
+        Creates a new span with sequence number and step range metadata.
+        Called at initialization and periodically to enable event export.
+
+        Args:
+            step_range_start: First scheduler step for this span
+
+        SAFETY: Never raises - all exceptions caught and logged.
+        """
+        if not self._enable_step_tracing or self.step_tracer is None:
+            return
+
+        try:
+            from vllm.tracing import SpanKind
+
+            # Increment sequence for each new span
+            self._step_span_sequence += 1
+            self._step_span_range_start = step_range_start
+
+            # Create span with sequence number in name for easy identification
+            span_name = f"scheduler_steps_{self._step_span_sequence}"
+
+            # Add metadata attributes for correlation and debugging
+            attributes = {
+                "scheduler.span_sequence": self._step_span_sequence,
+                "scheduler.step_range_start": step_range_start,
+                "scheduler.closure_interval": self._closure_interval_steps,
+            }
+
+            self._step_span = self.step_tracer.start_span(
+                name=span_name,
+                kind=SpanKind.INTERNAL,
+                attributes=attributes,
+            )
+
+            logger.debug(
+                "Opened step tracing span: %s (sequence=%d, start_step=%d)",
+                span_name, self._step_span_sequence, step_range_start
+            )
+
+        except Exception as e:
+            logger.warning("Failed to open step span: %s", e)
+            self._enable_step_tracing = False
+
+    def _close_step_span(self, step_range_end: int) -> None:
+        """Close the current scheduler_steps span to trigger export.
+
+        Ends the span, which moves it to BatchSpanProcessor's export queue.
+        The span (with all accumulated events) will be exported within ~5 seconds.
+
+        Args:
+            step_range_end: Last scheduler step included in this span
+
+        SAFETY: Never raises - all exceptions caught and logged.
+        """
+        if not self._enable_step_tracing or self._step_span is None:
+            return
+
+        try:
+            # Add final metadata before closing
+            self._step_span.set_attribute("scheduler.step_range_end", step_range_end)
+
+            # End span with explicit timestamp for precision
+            self._step_span.end(end_time=time.time_ns())
+
+            logger.debug(
+                "Closed step tracing span: scheduler_steps_%d (steps %d-%d)",
+                self._step_span_sequence,
+                self._step_span_range_start,
+                step_range_end
+            )
+
+        except Exception as e:
+            logger.warning("Failed to close step span: %s", e)
+            # Don't disable tracing - we'll try to open a new span
 
     def schedule(self) -> SchedulerOutput:
         # Increment the scheduler step counter at the start of each schedule call.
@@ -1141,6 +1224,25 @@ class Scheduler(SchedulerInterface):
         # This is a second probabilistic gate for high-cardinality per-request data
         if batch_summary_was_sampled and self._rich_sampler(curr_step, self._step_tracing_rich_subsample_rate):
             self._emit_rich_request_snapshots(scheduler_output, curr_step)
+
+        # Track if events were emitted for closure optimization
+        if batch_summary_was_sampled:
+            self._events_emitted_since_last_closure = True
+
+        # Periodic span closure for near-real-time export
+        if self._enable_step_tracing:
+            self._steps_since_last_closure += 1
+
+            if self._steps_since_last_closure >= self._closure_interval_steps:
+                # Close current span only if events were emitted
+                # This avoids creating empty spans when sampling rate is low
+                if self._events_emitted_since_last_closure:
+                    self._close_step_span(curr_step)
+                    self._open_step_span(curr_step + 1)
+
+                # Reset counters regardless of whether we closed/opened
+                self._steps_since_last_closure = 0
+                self._events_emitted_since_last_closure = False
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -2263,6 +2365,14 @@ class Scheduler(SchedulerInterface):
         return spec_decoding_stats
 
     def shutdown(self) -> None:
+        # Close final step tracing span to export remaining events
+        if self._enable_step_tracing and self._step_span is not None:
+            try:
+                logger.info("Closing final step tracing span on shutdown")
+                self._close_step_span(self.scheduler_step_counter)
+            except Exception as e:
+                logger.debug("Failed to close span on shutdown: %s", e)
+
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:

@@ -98,6 +98,11 @@ class ObservabilityConfig:
     Default 0.001 = 0.1% of steps get detailed per-request data. Only applies when
     step_tracing_enabled is True AND the step is batch-summary-sampled."""
 
+    step_tracing_closure_interval: int = Field(default=100, ge=10, le=10000)
+    """Close and reopen step tracing span every N scheduler steps for event export.
+    Default 100 steps. Lower values = faster visibility but more spans created.
+    Must be >= 10 to avoid excessive span creation. Range [10, 10000]."""
+
     journey_tracing_sample_rate: float = Field(default=1.0, ge=0.0, le=1.0)
     """Sampling rate for journey tracing. Range [0.0, 1.0].
     Default 1.0 = 100% (no sampling, backward compatible).
