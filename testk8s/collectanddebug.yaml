@@ -45,6 +45,8 @@ spec:
             - "0.1"
             - "--step-tracing-rich-subsample-rate"
             - "0.1"
+            - "--step-tracing-closure-interval"
+            - "10"
             - "--otlp-traces-endpoint"
             - "http://otel-collector:4318/v1/traces"
             - "--max-model-len"
@@ -178,14 +180,14 @@ spec:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-    name: data-pvc
+  name: data-pvc
 spec:
-    accessModes:
-    - ReadWriteMany
-    resources:
-        requests:
-            storage: 100Gi
-    volumeMode: Filesystem
+  accessModes:
+  - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  volumeMode: Filesystem
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -277,8 +279,26 @@ spec:
       port: 4318
       targetPort: 4318
 ---
-# use this pod to get traces as follows ... 
-# kubectl cp pvc-debug:/mnt/data/traces.json ./traces.json
+# This configuration demonstrates step tracing and journey tracing in Kubernetes
+# with traces exported to a file for debugging.
+#
+# Key features:
+# - Step tracing with high sampling (10% batch, 10% rich) for debugging
+# - Fast span closure (every 10 steps) for quick test iteration
+# - File exporter writes traces to persistent volume for extraction
+# - Debug pod allows easy trace file access via kubectl cp
+#
+# To extract and view traces:
+# 1. Deploy: kubectl apply -f testk8s/collectanddebug.yaml
+# 2. Send requests to vLLM server
+# 3. Wait ~15 seconds for traces to export
+# 4. Extract: kubectl cp pvc-debug:/mnt/data/traces.json ./traces.json
+# 5. View: jq '.' traces.json
+#
+# Expected spans in traces.json:
+# - Journey tracing: llm_core spans (one per request)
+# - Step tracing: scheduler_steps_1, scheduler_steps_2, etc. (one per 10 steps)
+#
 apiVersion: v1
 kind: Pod
 metadata:

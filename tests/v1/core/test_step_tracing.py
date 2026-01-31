@@ -726,3 +726,447 @@ def test_step_tracing_cli_wiring():
     assert obs_config.step_tracing_enabled is True
     assert obs_config.step_tracing_sample_rate == 0.75
     assert obs_config.step_tracing_rich_subsample_rate == 0.05
+
+
+# =============================================================================
+# Span Closure Tests (PR #X - Periodic Span Closure for Event Export)
+# =============================================================================
+
+
+def test_step_tracing_closure_interval_default():
+    """Test that default closure interval is 100 steps.
+
+    Verifies:
+    - Default value is 100
+    - Value is accessible via observability_config
+    """
+    scheduler = create_scheduler(
+        step_tracing_enabled=True,
+        otlp_traces_endpoint="http://localhost:4317",
+    )
+
+    # Verify default closure interval
+    assert scheduler._closure_interval_steps == 100
+    assert scheduler.observability_config.step_tracing_closure_interval == 100
+
+
+def test_step_tracing_span_closed_at_interval():
+    """Test that spans are closed every N steps.
+
+    Verifies:
+    - span.end() called after closure_interval steps
+    - New span created immediately after closure
+    - Counter resets after closure
+    """
+    with patch("vllm.tracing.init_tracer") as mock_init_tracer:
+        mock_tracer = Mock()
+        # Create list of mock spans to track span creation
+        mock_spans = [Mock() for _ in range(5)]
+        span_index = [0]  # Use list to allow mutation in closure
+
+        def create_span(*args, **kwargs):
+            span = mock_spans[span_index[0]]
+            span_index[0] += 1
+            return span
+
+        mock_tracer.start_span.side_effect = create_span
+        mock_init_tracer.return_value = mock_tracer
+
+        scheduler = create_scheduler(
+            step_tracing_enabled=True,
+            step_tracing_sample_rate=1.0,  # Always sample to trigger closure
+            step_tracing_closure_interval=10,  # Close every 10 steps
+            otlp_traces_endpoint="http://localhost:4317",
+        )
+
+        # Override sampler to always return True
+        scheduler._step_sampler = lambda step_id, rate: True
+
+        # Run 25 steps (should trigger 2 closures: at step 10 and 20)
+        for i in range(25):
+            output = scheduler.schedule()
+            assert output.scheduler_step == i + 1
+
+        # Verify: Initial span + 2 new spans = 3 spans created
+        assert mock_tracer.start_span.call_count == 3
+
+        # Verify: First 2 spans were ended (at steps 10 and 20)
+        assert mock_spans[0].end.call_count == 1
+        assert mock_spans[1].end.call_count == 1
+        assert mock_spans[2].end.call_count == 0  # Current span not closed yet
+
+
+def test_step_tracing_span_sequence_increments():
+    """Test that span sequence numbers increment correctly.
+
+    Verifies:
+    - Sequence starts at 1
+    - Increments for each new span
+    - Span names follow pattern: scheduler_steps_N
+    """
+    with patch("vllm.tracing.init_tracer") as mock_init_tracer:
+        mock_tracer = Mock()
+        mock_span = Mock()
+        mock_tracer.start_span.return_value = mock_span
+        mock_init_tracer.return_value = mock_tracer
+
+        scheduler = create_scheduler(
+            step_tracing_enabled=True,
+            step_tracing_sample_rate=1.0,
+            step_tracing_closure_interval=10,
+            otlp_traces_endpoint="http://localhost:4317",
+        )
+
+        # Override sampler
+        scheduler._step_sampler = lambda step_id, rate: True
+
+        # Run 25 steps (should create 3 spans total: initial + 2 closures)
+        for i in range(25):
+            scheduler.schedule()
+
+        # Extract span names from start_span calls
+        span_names = [call[1]["name"] for call in mock_tracer.start_span.call_args_list]
+
+        # Verify span naming: scheduler_steps_1, scheduler_steps_2, scheduler_steps_3
+        assert span_names == [
+            "scheduler_steps_1",
+            "scheduler_steps_2",
+            "scheduler_steps_3",
+        ]
+
+
+def test_step_tracing_closure_skipped_without_events():
+    """Test event-gated optimization: skip closure if no events emitted.
+
+    Verifies:
+    - If no events sampled, span NOT closed even after interval
+    - Counter still resets
+    - Avoids creating empty spans
+    """
+    with patch("vllm.tracing.init_tracer") as mock_init_tracer:
+        mock_tracer = Mock()
+        mock_span = Mock()
+        mock_tracer.start_span.return_value = mock_span
+        mock_init_tracer.return_value = mock_tracer
+
+        scheduler = create_scheduler(
+            step_tracing_enabled=True,
+            step_tracing_sample_rate=0.0,  # Never sample events
+            step_tracing_closure_interval=10,
+            otlp_traces_endpoint="http://localhost:4317",
+        )
+
+        # Override sampler to never sample
+        scheduler._step_sampler = lambda step_id, rate: False
+
+        # Run 25 steps with no events
+        for i in range(25):
+            scheduler.schedule()
+
+        # Verify: Only initial span created, no closures (no events emitted)
+        assert mock_tracer.start_span.call_count == 1
+        assert mock_span.end.call_count == 0
+
+
+def test_step_tracing_span_metadata():
+    """Test that span metadata is correct.
+
+    Verifies:
+    - span_sequence attribute
+    - step_range_start attribute
+    - step_range_end attribute (set on closure)
+    - closure_interval attribute
+    """
+    with patch("vllm.tracing.init_tracer") as mock_init_tracer:
+        mock_tracer = Mock()
+        mock_span = Mock()
+        mock_tracer.start_span.return_value = mock_span
+        mock_init_tracer.return_value = mock_tracer
+
+        scheduler = create_scheduler(
+            step_tracing_enabled=True,
+            step_tracing_sample_rate=1.0,
+            step_tracing_closure_interval=10,
+            otlp_traces_endpoint="http://localhost:4317",
+        )
+
+        # Override sampler
+        scheduler._step_sampler = lambda step_id, rate: True
+
+        # Run 15 steps (triggers one closure at step 10)
+        for i in range(15):
+            scheduler.schedule()
+
+        # Verify initial span attributes (span 1)
+        initial_attrs = mock_tracer.start_span.call_args_list[0][1]["attributes"]
+        assert initial_attrs["scheduler.span_sequence"] == 1
+        assert initial_attrs["scheduler.step_range_start"] == 1
+        assert initial_attrs["scheduler.closure_interval"] == 10
+
+        # Verify second span attributes (span 2, created after step 10)
+        second_attrs = mock_tracer.start_span.call_args_list[1][1]["attributes"]
+        assert second_attrs["scheduler.span_sequence"] == 2
+        assert second_attrs["scheduler.step_range_start"] == 11
+        assert second_attrs["scheduler.closure_interval"] == 10
+
+        # Verify step_range_end was set on first span before closure
+        set_attribute_calls = mock_span.set_attribute.call_args_list
+        # Find the set_attribute call for step_range_end (should be 10)
+        range_end_calls = [
+            call for call in set_attribute_calls
+            if call[0][0] == "scheduler.step_range_end"
+        ]
+        assert len(range_end_calls) >= 1
+        assert range_end_calls[0][0][1] == 10  # step_range_end value
+
+
+def test_step_tracing_span_closure_on_shutdown():
+    """Test that final span is closed on shutdown.
+
+    Verifies:
+    - shutdown() closes the current span
+    - Final span has correct step_range_end
+    """
+    with patch("vllm.tracing.init_tracer") as mock_init_tracer:
+        mock_tracer = Mock()
+        mock_span = Mock()
+        mock_tracer.start_span.return_value = mock_span
+        mock_init_tracer.return_value = mock_tracer
+
+        scheduler = create_scheduler(
+            step_tracing_enabled=True,
+            step_tracing_sample_rate=1.0,
+            step_tracing_closure_interval=100,
+            otlp_traces_endpoint="http://localhost:4317",
+        )
+
+        # Override sampler
+        scheduler._step_sampler = lambda step_id, rate: True
+
+        # Run 15 steps (no closure yet, interval is 100)
+        for i in range(15):
+            scheduler.schedule()
+
+        # Verify span not closed yet
+        assert mock_span.end.call_count == 0
+
+        # Call shutdown
+        scheduler.shutdown()
+
+        # Verify span was closed
+        assert mock_span.end.call_count == 1
+
+        # Verify final step_range_end was set to 15
+        set_attribute_calls = mock_span.set_attribute.call_args_list
+        range_end_calls = [
+            call for call in set_attribute_calls
+            if call[0][0] == "scheduler.step_range_end"
+        ]
+        assert len(range_end_calls) == 1
+        assert range_end_calls[0][0][1] == 15
+
+
+def test_step_tracing_span_creation_failure_disables_tracing():
+    """Test that span creation failure disables tracing gracefully.
+
+    Verifies:
+    - Exception during _open_step_span() disables tracing
+    - Scheduler continues to work
+    - No crashes
+    """
+    with patch("vllm.tracing.init_tracer") as mock_init_tracer:
+        mock_tracer = Mock()
+        # Make start_span raise exception
+        mock_tracer.start_span.side_effect = Exception("Mock span creation failure")
+        mock_init_tracer.return_value = mock_tracer
+
+        scheduler = create_scheduler(
+            step_tracing_enabled=True,
+            step_tracing_sample_rate=1.0,
+            otlp_traces_endpoint="http://localhost:4317",
+        )
+
+        # Verify tracing was disabled due to failure
+        assert not scheduler._enable_step_tracing
+
+        # Verify scheduler still works
+        requests = create_requests(num_requests=2)
+        for request in requests:
+            scheduler.add_request(request)
+
+        output = scheduler.schedule()
+        assert output.scheduler_step == 1
+        assert len(output.scheduled_new_reqs) == 2
+
+
+def test_step_tracing_span_closure_failure_preserves_span():
+    """Test that span closure failure doesn't disable tracing.
+
+    Verifies:
+    - Exception during span.end() doesn't disable tracing
+    - Span remains open (can retry next interval)
+    - Scheduler continues to work
+    """
+    with patch("vllm.tracing.init_tracer") as mock_init_tracer:
+        mock_tracer = Mock()
+        mock_span = Mock()
+        # Make span.end() raise exception
+        mock_span.end.side_effect = Exception("Mock closure failure")
+        mock_tracer.start_span.return_value = mock_span
+        mock_init_tracer.return_value = mock_tracer
+
+        scheduler = create_scheduler(
+            step_tracing_enabled=True,
+            step_tracing_sample_rate=1.0,
+            step_tracing_closure_interval=10,  # Minimum allowed value
+            otlp_traces_endpoint="http://localhost:4317",
+        )
+
+        # Override sampler
+        scheduler._step_sampler = lambda step_id, rate: True
+
+        # Run 15 steps (should attempt closure at step 10)
+        for i in range(15):
+            output = scheduler.schedule()
+            assert output.scheduler_step == i + 1
+
+        # Verify: Tracing still enabled despite closure failure
+        assert scheduler._enable_step_tracing
+
+        # Verify: span.end() was called (attempted closure)
+        assert mock_span.end.call_count >= 1
+
+
+def test_step_tracing_multiple_closure_cycles():
+    """Test multiple closure cycles work correctly.
+
+    Verifies:
+    - Multiple closures work in sequence
+    - Each span gets correct sequence number
+    - Events distributed across spans correctly
+    """
+    with patch("vllm.tracing.init_tracer") as mock_init_tracer:
+        mock_tracer = Mock()
+        # Create multiple mock spans
+        mock_spans = [Mock() for _ in range(10)]
+        span_index = [0]
+
+        def create_span(*args, **kwargs):
+            span = mock_spans[span_index[0]]
+            span_index[0] += 1
+            return span
+
+        mock_tracer.start_span.side_effect = create_span
+        mock_init_tracer.return_value = mock_tracer
+
+        scheduler = create_scheduler(
+            step_tracing_enabled=True,
+            step_tracing_sample_rate=1.0,
+            step_tracing_closure_interval=10,
+            otlp_traces_endpoint="http://localhost:4317",
+        )
+
+        # Override sampler
+        scheduler._step_sampler = lambda step_id, rate: True
+
+        # Run 35 steps (should create 4 spans: initial + 3 closures)
+        for i in range(35):
+            scheduler.schedule()
+
+        # Verify 4 spans created
+        assert mock_tracer.start_span.call_count == 4
+
+        # Verify first 3 spans were closed
+        assert mock_spans[0].end.call_count == 1
+        assert mock_spans[1].end.call_count == 1
+        assert mock_spans[2].end.call_count == 1
+        assert mock_spans[3].end.call_count == 0  # Current span
+
+        # Verify each span has events (since sample_rate=1.0)
+        for i in range(3):
+            # Each closed span should have add_event calls
+            assert mock_spans[i].add_event.call_count >= 10  # At least 10 steps
+
+
+def test_step_tracing_closure_interval_edge_cases():
+    """Test closure interval edge cases.
+
+    Verifies:
+    - Minimum interval (10) works
+    - Maximum interval (10000) works
+    - Custom intervals work correctly
+    """
+    # Test minimum interval
+    with patch("vllm.tracing.init_tracer") as mock_init_tracer:
+        mock_tracer = Mock()
+        mock_span = Mock()
+        mock_tracer.start_span.return_value = mock_span
+        mock_init_tracer.return_value = mock_tracer
+
+        scheduler = create_scheduler(
+            step_tracing_enabled=True,
+            step_tracing_sample_rate=1.0,
+            step_tracing_closure_interval=10,  # Minimum
+            otlp_traces_endpoint="http://localhost:4317",
+        )
+
+        scheduler._step_sampler = lambda step_id, rate: True
+
+        # Run 25 steps
+        for i in range(25):
+            scheduler.schedule()
+
+        # Should have 3 spans (initial + 2 closures at 10, 20)
+        assert mock_tracer.start_span.call_count == 3
+
+    # Test large interval
+    with patch("vllm.tracing.init_tracer") as mock_init_tracer:
+        mock_tracer = Mock()
+        mock_span = Mock()
+        mock_tracer.start_span.return_value = mock_span
+        mock_init_tracer.return_value = mock_tracer
+
+        scheduler = create_scheduler(
+            step_tracing_enabled=True,
+            step_tracing_sample_rate=1.0,
+            step_tracing_closure_interval=10000,  # Maximum
+            otlp_traces_endpoint="http://localhost:4317",
+        )
+
+        scheduler._step_sampler = lambda step_id, rate: True
+
+        # Run 100 steps (well below interval)
+        for i in range(100):
+            scheduler.schedule()
+
+        # Should have only 1 span (no closures yet)
+        assert mock_tracer.start_span.call_count == 1
+        assert mock_span.end.call_count == 0
+
+
+def test_step_tracing_closure_interval_cli_wiring():
+    """Test that --step-tracing-closure-interval CLI flag is properly wired.
+
+    Verifies:
+    - CLI flag flows through to ObservabilityConfig
+    - Default value is 100
+    - Custom values are respected
+    """
+    from vllm.engine.arg_utils import EngineArgs
+
+    # Test default value
+    engine_args = EngineArgs(
+        model="facebook/opt-125m",
+        step_tracing_enabled=True,
+    )
+    vllm_config = engine_args.create_engine_config()
+    assert vllm_config.observability_config.step_tracing_closure_interval == 100
+
+    # Test custom value
+    engine_args = EngineArgs(
+        model="facebook/opt-125m",
+        step_tracing_enabled=True,
+        step_tracing_closure_interval=50,
+    )
+    vllm_config = engine_args.create_engine_config()
+    assert vllm_config.observability_config.step_tracing_closure_interval == 50

@@ -87,11 +87,11 @@ wait
 1. Open http://localhost:16686
 2. Select your vLLM service (default: "vllm")
 3. Click "Find Traces"
-4. Look for traces containing a `scheduler_steps` span with `step.BATCH_SUMMARY` events. The exact UI varies by backend:
+4. Look for traces containing `scheduler_steps_1`, `scheduler_steps_2`, etc. spans with `step.BATCH_SUMMARY` events. The exact UI varies by backend:
    - **Jaeger:** Select service → expand span → view events
    - **Other backends:** Consult your tracing UI documentation for viewing span events
 
-You'll see a timeline showing sampled scheduler steps with aggregate metrics.
+You'll see multiple spans (one per 100 steps by default), each containing sampled scheduler steps with aggregate metrics.
 
 ---
 
@@ -218,6 +218,10 @@ Step 150: waiting=25, duration=22ms, tokens=1600  ← Queue growing!
 
 --step-tracing-rich-subsample-rate RATE      # Rich snapshot subsampling [0.0-1.0]
                                               # Default: 0.001 (0.1% of steps)
+
+--step-tracing-closure-interval N            # Close and reopen span every N steps
+                                              # Default: 100 steps. Range: [10, 10000]
+                                              # Controls event export latency
 ```
 
 ### Common Configurations
@@ -381,6 +385,7 @@ Step tracing provides **sampled snapshots**, not continuous metrics:
 2. Is `--otlp-traces-endpoint` correct and reachable?
 3. Is sampling rate > 0.0? (Default 0.01 is fine)
 4. Are you sending requests? (Empty idle periods won't generate events)
+5. Have you waited long enough? Events export after the span closes (default: every 100 steps + ~5 second OTEL export delay)
 
 **Verify:**
 ```bash
@@ -389,6 +394,11 @@ grep -i "step tracing" /path/to/vllm.log
 
 # Should see log messages about step tracing initialization (exact wording may vary by vLLM version)
 ```
+
+**Note on span naming:**
+- Spans are named `scheduler_steps_1`, `scheduler_steps_2`, `scheduler_steps_3`, etc.
+- You'll see multiple spans (not a single `scheduler_steps` span)
+- This is expected behavior to enable event export
 
 ### Too Many Events (High Cardinality)
 
@@ -456,9 +466,10 @@ They use different tracer scopes and don't interfere with each other.
 
 **A:**
 1. Select your service (e.g., "vllm") in the service dropdown
-2. Find traces with the `scheduler_steps` span
+2. Find traces with `scheduler_steps_1`, `scheduler_steps_2`, etc. spans
 3. Look for spans with scope name `vllm.scheduler.step` (visible in span details)
-4. Expand the span to see `step.BATCH_SUMMARY` and `step.REQUEST_SNAPSHOT` events
+4. Expand any span to see `step.BATCH_SUMMARY` and `step.REQUEST_SNAPSHOT` events
+5. Use `step.id` attribute to correlate events across multiple spans
 
 ### Q: What's the difference between the two sample rates?
 
@@ -492,15 +503,58 @@ For deterministic analysis, set `--step-tracing-sample-rate 1.0` temporarily.
 - Misconfigured exporters: May experience brief delays or event loss
 - Step tracing failures never crash the scheduler, but check your OTEL SDK logs if you see issues.
 
-### Q: How long is the `scheduler_steps` span?
+### Q: How long is each `scheduler_steps` span?
 
-**A:** It's a long-lived span created at scheduler initialization and active for the lifetime of the scheduler process. All step events are emitted on this single span.
+**A:** Step tracing creates **multiple short-lived spans** to enable near-real-time event export. By default, a new span is created every 100 scheduler steps:
 
-**On graceful shutdown:** The span may be closed if the OTEL SDK has time to flush (depends on shutdown timeout and SDK configuration).
+- `scheduler_steps_1` - Events for steps 1-100
+- `scheduler_steps_2` - Events for steps 101-200
+- `scheduler_steps_3` - Events for steps 201-300
+- ...and so on
 
-**On crashes:** The span will remain open in your tracing backend, which is normal. Incomplete spans indicate process termination.
+**Why multiple spans?** OpenTelemetry only exports **closed spans**. By closing spans periodically (every N steps), events are exported within seconds instead of being trapped in memory.
 
-This is different from journey tracing, where each request gets its own short-lived spans.
+**Span closure timing:**
+- Automatically every `--step-tracing-closure-interval` steps (default: 100)
+- On graceful shutdown for the final span
+- Each closed span is exported to your OTEL collector within ~5 seconds
+
+**Event correlation:** All events have a `step.id` attribute that provides ordering across spans, so you can still correlate events even though they're split across multiple spans.
+
+This is different from the old behavior (single span) and from journey tracing (one span per request).
+
+### Q: How do I tune event export latency?
+
+**A:** Use `--step-tracing-closure-interval` to control how often spans are closed and exported:
+
+**Faster visibility (more spans):**
+```bash
+--step-tracing-closure-interval 10  # New span every 10 steps
+# Events visible in ~1 second (at 100 Hz step rate)
+```
+
+**Default (balanced):**
+```bash
+--step-tracing-closure-interval 100  # Default
+# Events visible in ~6 seconds (at 100 Hz step rate)
+```
+
+**Fewer spans (slower visibility):**
+```bash
+--step-tracing-closure-interval 1000
+# Events visible in ~60 seconds (at 100 Hz step rate)
+```
+
+**Trade-offs:**
+- Lower interval: Faster event visibility, more spans created, slightly higher overhead
+- Higher interval: Slower visibility, fewer spans, lower overhead
+
+**Recommendation:** Start with default (100). Adjust based on:
+- Your step rate (higher step rate → increase interval)
+- Your observability requirements (need real-time visibility → decrease interval)
+- Your collector capacity (collector struggling → increase interval)
+
+**Span creation rate:** `spans_per_sec = step_rate / closure_interval`
 
 ### Q: Can I export to multiple backends?
 
@@ -520,6 +574,98 @@ service:
       receivers: [otlp]
       exporters: [jaeger, otlp/tempo]
 ```
+
+---
+
+## Kubernetes Example
+
+### Complete Debugging Setup
+
+The `testk8s/collectanddebug.yaml` file provides a complete Kubernetes setup for step tracing with trace collection to a file:
+
+**What it includes:**
+- vLLM server with step tracing and journey tracing enabled
+- OTEL collector that writes traces to a persistent volume
+- Debug pod for extracting trace files
+- High sampling rates (10% batch, 10% rich) for detailed debugging
+- Fast span closure (every 10 steps) for quick test iteration
+
+**To use:**
+
+```bash
+# 1. Deploy the complete stack
+kubectl apply -f testk8s/collectanddebug.yaml
+
+# 2. Wait for vLLM to be ready
+kubectl wait --for=condition=ready pod -l app=vllm-server-opt --timeout=300s
+
+# 3. Send test requests
+kubectl port-forward svc/vllm-server 8000:8000 &
+for i in {1..20}; do
+  curl http://localhost:8000/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "opt-125m",
+      "messages": [{"role": "user", "content": "Hello!"}]
+    }' &
+done
+wait
+
+# 4. Wait for traces to export (~15 seconds)
+sleep 15
+
+# 5. Extract traces from persistent volume
+kubectl cp pvc-debug:/mnt/data/traces.json ./traces.json
+
+# 6. View step tracing spans
+jq '.resourceSpans[].scopeSpans[] | select(.scope.name == "vllm.scheduler.step") | .spans[].name' traces.json
+
+# Should output:
+# "scheduler_steps_1"
+# "scheduler_steps_2"
+# "scheduler_steps_3"
+# ...
+
+# 7. View events in a specific span
+jq '.resourceSpans[].scopeSpans[] | select(.scope.name == "vllm.scheduler.step") | .spans[0].events[] | .name' traces.json
+
+# Should output:
+# "step.BATCH_SUMMARY"
+# "step.REQUEST_SNAPSHOT"
+# ...
+```
+
+**Configuration highlights:**
+
+```yaml
+# vLLM args (from testk8s/collectanddebug.yaml)
+args:
+  - "--step-tracing-enabled"
+  - "--step-tracing-sample-rate" "0.1"              # 10% batch sampling
+  - "--step-tracing-rich-subsample-rate" "0.1"     # 10% rich sampling
+  - "--step-tracing-closure-interval" "10"         # Close span every 10 steps
+  - "--otlp-traces-endpoint" "http://otel-collector:4318/v1/traces"
+
+# OTEL Collector exporter
+exporters:
+  file:
+    path: /data/traces.json  # Write to persistent volume
+```
+
+**Why this is useful:**
+- **File-based debugging**: No need for Jaeger/Tempo - traces written to file
+- **Easy extraction**: Simple `kubectl cp` to get trace data
+- **Fast iteration**: Short closure interval (10 steps) means quick visibility
+- **High visibility**: 10% sampling rates capture lots of detail
+- **Complete example**: Shows both step and journey tracing together
+
+**Production differences:**
+- In production, use `--step-tracing-sample-rate 0.01` (1%, not 10%)
+- Use `--step-tracing-closure-interval 100` (default, not 10)
+- Export to Jaeger/Tempo/etc instead of file
+- Disable rich snapshots or use 0.001 rate
+
+This setup is specifically tuned for **debugging and development**, not production use.
 
 ---
 
@@ -656,36 +802,85 @@ Example (1000 steps/sec, 50 requests, defaults):
 <details>
 <summary><b>OTEL Span Structure</b></summary>
 
-Step tracing creates a single long-lived span:
+Step tracing creates **multiple short-lived spans** to enable near-real-time event export:
 
 ```
 Service: vllm (or value of OTEL_SERVICE_NAME)
 └─ Tracer Scope: vllm.scheduler.step
-   └─ Span: scheduler_steps (SpanKind.INTERNAL)
-      ├─ Event: step.BATCH_SUMMARY (step=1)
-      ├─ Event: step.REQUEST_SNAPSHOT (step=1, req=A)
-      ├─ Event: step.REQUEST_SNAPSHOT (step=1, req=B)
-      ├─ Event: step.BATCH_SUMMARY (step=3) [step 2 not sampled]
-      ├─ Event: step.REQUEST_SNAPSHOT (step=3, req=A)
-      └─ ...continues for lifetime of scheduler
+   ├─ Span: scheduler_steps_1 (SpanKind.INTERNAL, steps 1-100)
+   │  ├─ Attributes:
+   │  │  ├─ scheduler.span_sequence = 1
+   │  │  ├─ scheduler.step_range_start = 1
+   │  │  ├─ scheduler.step_range_end = 100
+   │  │  └─ scheduler.closure_interval = 100
+   │  ├─ Event: step.BATCH_SUMMARY (step.id=1)
+   │  ├─ Event: step.BATCH_SUMMARY (step.id=5) [steps 2-4 not sampled]
+   │  ├─ Event: step.REQUEST_SNAPSHOT (step.id=5, req=A)
+   │  └─ ...events for steps 1-100
+   │
+   ├─ Span: scheduler_steps_2 (SpanKind.INTERNAL, steps 101-200)
+   │  ├─ Attributes:
+   │  │  ├─ scheduler.span_sequence = 2
+   │  │  ├─ scheduler.step_range_start = 101
+   │  │  ├─ scheduler.step_range_end = 200
+   │  │  └─ scheduler.closure_interval = 100
+   │  └─ ...events for steps 101-200
+   │
+   └─ Span: scheduler_steps_3 (SpanKind.INTERNAL, steps 201-300)
+      └─ ...continues while scheduler runs
 ```
 
 **Key Properties:**
-- **Span lifetime:** Created at scheduler initialization, closed on graceful shutdown (if OTEL SDK flushes successfully). On crashes, span remains open indefinitely.
-- **Span name:** `scheduler_steps`
+- **Span lifetime:** Each span covers N steps (default: 100), closed automatically when full
+- **Span names:** `scheduler_steps_1`, `scheduler_steps_2`, `scheduler_steps_3`, ... (sequential)
 - **Span kind:** `INTERNAL` (not client/server)
 - **Tracer scope:** `vllm.scheduler.step` (different from journey tracing's `vllm.scheduler`)
-- **All events on one span:** Simplifies querying and reduces span overhead
+- **Multiple spans:** Enables event export without waiting for process termination
+- **Event correlation:** Use `step.id` attribute to order events across all spans
+
+**Why Multiple Spans?**
+
+OpenTelemetry's `BatchSpanProcessor` only exports **closed spans**. Events on open spans remain in memory and are not sent to collectors until `span.end()` is called.
+
+**Old behavior (broken):**
+- Single span for entire scheduler lifetime
+- Events trapped in memory forever
+- Only exported on graceful shutdown (if at all)
+
+**New behavior (working):**
+- New span every 100 steps (configurable)
+- Each span closed automatically → triggers export
+- Events visible in collector within ~5-10 seconds
+
+**Tuning export latency:**
+```bash
+# Faster visibility (more spans created)
+--step-tracing-closure-interval 10
+
+# Default (balanced)
+--step-tracing-closure-interval 100
+
+# Fewer spans (slower visibility)
+--step-tracing-closure-interval 1000
+```
+
+**Span creation rate:** `spans_per_second = step_rate / closure_interval`
+
+Example: At 100 steps/sec with default interval (100):
+- 1 span created per second
+- Each span exported within ~5 seconds
+- Event visibility: ~6 seconds total latency
 
 **Comparison to Journey Tracing:**
 
 | Aspect | Journey Tracing | Step Tracing |
 |--------|----------------|--------------|
-| Span per | Request | Scheduler lifetime |
-| Span count | ~2 per request | 1 total |
-| Span lifetime | Request duration | Process lifetime |
+| Span per | Request | 100 steps (default) |
+| Span count | ~2 per request | ~1-10 per second (typical) |
+| Span lifetime | Request duration (ms-sec) | 100 steps (sec-min) |
 | Tracer scope | `vllm.api`, `vllm.scheduler` | `vllm.scheduler.step` |
-| Events per span | ~5-10 | Thousands (sampled) |
+| Events per span | ~5-10 | ~1-100 (sampled) |
+| Export latency | Immediate on completion | ~5-10 seconds |
 
 </details>
 

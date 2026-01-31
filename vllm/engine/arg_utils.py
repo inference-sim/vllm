@@ -535,6 +535,9 @@ class EngineArgs:
     step_tracing_rich_subsample_rate: float = get_field(
         ObservabilityConfig, "step_tracing_rich_subsample_rate"
     )
+    step_tracing_closure_interval: int = get_field(
+        ObservabilityConfig, "step_tracing_closure_interval"
+    )
     journey_tracing_sample_rate: float = get_field(
         ObservabilityConfig, "journey_tracing_sample_rate"
     )
@@ -1095,6 +1098,10 @@ class EngineArgs:
         observability_group.add_argument(
             "--step-tracing-rich-subsample-rate",
             **observability_kwargs["step_tracing_rich_subsample_rate"],
+        )
+        observability_group.add_argument(
+            "--step-tracing-closure-interval",
+            **observability_kwargs["step_tracing_closure_interval"],
         )
         observability_group.add_argument(
             "--journey-tracing-sample-rate",
@@ -1760,6 +1767,7 @@ class EngineArgs:
             step_tracing_enabled=self.step_tracing_enabled,
             step_tracing_sample_rate=self.step_tracing_sample_rate,
             step_tracing_rich_subsample_rate=self.step_tracing_rich_subsample_rate,
+            step_tracing_closure_interval=self.step_tracing_closure_interval,
             journey_tracing_sample_rate=self.journey_tracing_sample_rate,
         )
 

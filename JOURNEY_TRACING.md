@@ -971,6 +971,79 @@ If `enable_journey_tracing=False`, no traces are created regardless of sample ra
 
 ---
 
+## Kubernetes Example
+
+The `testk8s/collectanddebug.yaml` configuration demonstrates journey tracing (along with step tracing) in Kubernetes with file-based trace collection for debugging.
+
+### Configuration Highlights
+
+- **Journey tracing enabled**: `--enable-journey-tracing` captures request lifecycle
+- **Step tracing enabled**: `--step-tracing-enabled` captures scheduler-level events
+- **File exporter**: OTEL collector writes traces to persistent volume at `/data/traces.json`
+- **Debug pod**: Provides easy access to trace files via `kubectl cp`
+
+### Quick Start
+
+```bash
+# 1. Deploy vLLM with OTEL collector and debug pod
+kubectl apply -f testk8s/collectanddebug.yaml
+
+# 2. Wait for vLLM server to be ready
+kubectl wait --for=condition=ready pod -l app=vllm-server-opt --timeout=300s
+
+# 3. Send test requests to generate traces
+kubectl port-forward svc/vllm-server 8000:8000 &
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opt-125m",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+
+# 4. Wait ~15 seconds for traces to export to file
+
+# 5. Extract traces from debug pod
+kubectl cp pvc-debug:/mnt/data/traces.json ./traces.json
+
+# 6. View journey traces (API layer - vllm.api scope)
+jq '.resourceSpans[].scopeSpans[] | select(.scope.name == "vllm.api")' traces.json
+
+# 7. View journey traces (Engine layer - vllm.scheduler scope)
+jq '.resourceSpans[].scopeSpans[] | select(.scope.name == "vllm.scheduler")' traces.json
+
+# 8. View all journey events across both layers
+jq '.resourceSpans[].scopeSpans[] |
+    select(.scope.name == "vllm.api" or .scope.name == "vllm.scheduler") |
+    .spans[].events[]' traces.json
+```
+
+### What You'll See
+
+**API layer spans (`vllm.api` scope):**
+- Span name: `llm_request`
+- Events: `api.ARRIVED`, `api.HANDOFF_TO_CORE`, `api.FIRST_RESPONSE_FROM_CORE`, `api.DEPARTED`
+
+**Engine layer spans (`vllm.scheduler` scope):**
+- Span name: `llm_core`
+- Events: `journey.QUEUED`, `journey.SCHEDULED`, `journey.FIRST_TOKEN`, `journey.FINISHED`
+
+**Parent-child relationship:**
+- Both spans share the same `trace_id`
+- `llm_core` span has `parent_span_id` pointing to `llm_request` span
+- Complete request journey visible in the trace hierarchy
+
+### Why This is Useful
+
+This configuration is ideal for:
+- **Debugging**: File-based collection allows offline analysis
+- **Testing**: Fast span closure intervals for quick iteration
+- **Learning**: See both journey and step tracing working together
+- **CI/CD**: Extract traces programmatically for validation
+
+For production deployments, replace the file exporter with a backend like Jaeger or Tempo (see [Trace Backends](#trace-backends)).
+
+---
+
 ## What's Next?
 
 **For more help:**
