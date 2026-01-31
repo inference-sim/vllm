@@ -42,9 +42,6 @@ jobs:
           sudo apt-get clean
           sudo rm -rf /var/lib/apt/lists/*
 
-          # Remove Docker images and containers
-          sudo docker system prune --all --volumes --force
-
           # Remove swap file (we have enough RAM)
           sudo swapoff -a
           sudo rm -f /swapfile
@@ -99,19 +96,42 @@ jobs:
             org.opencontainers.image.vendor=inference-sim
             org.opencontainers.image.licenses=Apache-2.0
 
-      - name: Build and push Docker image (fast fork build)
+      - name: Build image locally (for validation)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.fork
           platforms: linux/amd64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          load: true              # 👈 load into local docker
+          push: false
+          tags: local/vllm-test:ci
           build-args: |
             VLLM_BASE_VERSION=v0.14.1
           cache-from: type=gha
           cache-to: type=gha,mode=min
 
-      # Skip test image build to save disk space and time
-      # - name: Build and push test image
+      - name: Validate built image (OTEL + vLLM imports)
+        run: |
+          docker run --rm local/vllm-test:ci \
+            python3 - <<'EOF'
+          import opentelemetry.sdk
+          import opentelemetry.exporter.otlp.proto.http.trace_exporter
+          import vllm
+          print("✅ OTEL + vLLM imports OK")
+          EOF
+
+          docker run --rm local/vllm-test:ci vllm --help >/dev/null
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.fork
+          platforms: linux/amd64
+          push: True
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VLLM_BASE_VERSION=v0.14.1
+          cache-from: type=gha
+

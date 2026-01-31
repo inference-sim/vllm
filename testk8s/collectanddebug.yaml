@@ -1,0 +1,308 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-server-opt
+  template:
+    metadata:
+      labels:
+        app: vllm-server-opt
+    spec:
+      terminationGracePeriodSeconds: 20
+      restartPolicy: Always
+
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-H100-80GB-HBM3
+
+      containers:
+        - name: vllm
+          image: ghcr.io/inference-sim/vllm:0.4.1
+          imagePullPolicy: IfNotPresent
+
+          resources:
+            limits:
+              nvidia.com/gpu: 1
+
+          args:
+            - "--model"
+            - "facebook/opt-125m"
+            - "--served-model-name"
+            - "opt-125m"
+            - "--enable-journey-tracing"
+            - "--step-tracing-enabled"
+            - "--step-tracing-sample-rate"
+            - "0.1"
+            - "--step-tracing-rich-subsample-rate"
+            - "0.1"
+            - "--otlp-traces-endpoint"
+            - "http://otel-collector:4318/v1/traces"
+            - "--max-model-len"
+            - "1024"
+            - "--max-num-batched-tokens"
+            - "1024"
+
+          ports:
+            - containerPort: 8000
+              name: http
+
+          readinessProbe:
+            httpGet:
+              path: /v1/models
+              port: 8000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 2
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            timeoutSeconds: 2
+
+          env:
+            # ---------- NVIDIA ----------
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "compute,utility"
+
+            # ---------- FIX: writable HOME ----------
+            - name: HOME
+              value: "/cache"
+
+            # ---------- FIX: pip user installs ----------
+            - name: PYTHONUSERBASE
+              value: "/cache/.local"
+            - name: PATH
+              value: "/cache/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+            # ---------- FIX: Hugging Face / Transformers caches ----------
+            - name: HF_HOME
+              value: /cache/huggingface
+            - name: HF_HUB_CACHE
+              value: /cache/huggingface/hub
+            - name: TRANSFORMERS_CACHE
+              value: /cache/huggingface/transformers
+            - name: XDG_CACHE_HOME
+              value: /cache/xdg
+            - name: XDG_CONFIG_HOME
+              value: /cache/config/xdg
+
+            # ---------- FIX: authenticate to avoid 429 ----------
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+            # Some libs look for this too; harmless if unused
+            - name: HUGGINGFACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: token
+
+            # ---------- OTEL ----------
+            - name: OTEL_SERVICE_NAME
+              value: "vllm-exp1"
+
+            - name: OTEL_TRACES_SAMPLER
+              value: "traceidratio"
+            - name: OTEL_TRACES_SAMPLER_ARG
+              value: "1.0"
+
+            - name: OTEL_TRACES_EXPORTER
+              value: "otlp"
+
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: "http/protobuf"
+            - name: OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
+              value: "http/protobuf"
+
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: "http://otel-collector:4318"
+            - name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              value: "http://otel-collector:4318"
+            - name: OTEL_EXPORTER_OTLP_TRACES_INSECURE
+              value: "true"
+
+            # ---------- vLLM ----------
+            - name: VLLM_LOGGING_LEVEL
+              value: "DEBUG"
+
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+
+      volumes:
+        - name: cache
+          persistentVolumeClaim:
+            claimName: vllm-cache-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vllm-cache-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-server
+spec:
+  selector:
+    app: vllm-server-opt
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+    name: data-pvc
+spec:
+    accessModes:
+    - ReadWriteMany
+    resources:
+        requests:
+            storage: 100Gi
+    volumeMode: Filesystem
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+data:
+  otel-config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      batch:
+
+    exporters:
+      file:
+        path: /data/traces.json
+
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [file]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+
+      containers:
+        - name: otel-collector
+          image: otel/opentelemetry-collector:0.144.0
+          args:
+            - "--config=/etc/otel/otel-config.yaml"
+          ports:
+            - containerPort: 4317
+            - containerPort: 4318
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: otel-config
+              mountPath: /etc/otel
+            - name: data-storage
+              mountPath: /data
+
+      volumes:
+        - name: otel-config
+          configMap:
+            name: otel-collector-config
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: data-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: grpc
+      port: 4317
+      targetPort: 4317
+    - name: http
+      port: 4318
+      targetPort: 4318
+---
+# use this pod to get traces as follows ... 
+# kubectl cp pvc-debug:/mnt/data/traces.json ./traces.json
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pvc-debug
+spec:
+  restartPolicy: Never
+  securityContext:
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: shell
+      image: busybox:1.36
+      command: ["/bin/sh", "-c", "sleep 365d"]
+      securityContext:
+        allowPrivilegeEscalation: false
+        runAsNonRoot: true
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      volumeMounts:
+        - name: data
+          mountPath: /mnt/data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: data-pvc
