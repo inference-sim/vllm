@@ -85,8 +85,268 @@ class AllBlocksCleared(KVCacheEvent):
     pass
 
 
+# =============================================================================
+# Transfer and Cache Operation Events (Phase 1 of KV Offloading Tracing)
+# =============================================================================
+
+
+class TransferInitiated(KVCacheEvent):
+    """Emitted when a DMA transfer is submitted to hardware.
+
+    This event is emitted AFTER transfer_async() returns True.
+    Every TransferInitiated MUST have exactly one matching TransferCompleted.
+    """
+
+    transfer_id: int
+    """Globally unique ID: (emitter_rank << 32) | local_counter"""
+
+    request_id: str
+    """Request ID for correlation with journey events"""
+
+    source_medium: str
+    """Source storage medium (GPU, CPU, DISK, LMCACHE)"""
+
+    dest_medium: str
+    """Destination storage medium"""
+
+    block_count: int
+    """Number of blocks being transferred"""
+
+    scheduler_step: int
+    """Scheduler step when transfer was initiated"""
+
+
+class TransferCompleted(KVCacheEvent):
+    """Emitted when a DMA transfer finishes (success or failure).
+
+    This event is emitted AFTER get_finished() returns a job.
+    Must be emitted for every TransferInitiated (No-Disappear guarantee).
+    """
+
+    transfer_id: int
+    """Matches the transfer_id from TransferInitiated"""
+
+    request_id: str
+    """Request ID for correlation"""
+
+    source_medium: str
+    """Source storage medium"""
+
+    dest_medium: str
+    """Destination storage medium"""
+
+    block_count: int
+    """Number of blocks transferred"""
+
+    success: bool
+    """True if transfer completed successfully, False on failure"""
+
+    scheduler_step: int
+    """Scheduler step when transfer was initiated (for correlation)"""
+
+
+class RemoteTransferInitiated(KVCacheEvent):
+    """Emitted when a cross-machine transfer starts.
+
+    No scheduler_step field because disaggregated schedulers are unsynchronized.
+    """
+
+    transfer_id: int
+    """Globally unique ID: (emitter_rank << 32) | local_counter"""
+
+    request_id: str
+    """Request ID for correlation"""
+
+    connector_type: str
+    """Type of connector (NIXL, P2P, MOONCAKE)"""
+
+    source_rank: int
+    """Source rank in distributed setup"""
+
+    dest_rank: int
+    """Destination rank"""
+
+    block_count: int
+    """Number of blocks being transferred"""
+
+
+class RemoteTransferCompleted(KVCacheEvent):
+    """Emitted when a cross-machine transfer finishes.
+
+    No scheduler_step field because disaggregated schedulers are unsynchronized.
+    """
+
+    transfer_id: int
+    """Matches the transfer_id from RemoteTransferInitiated"""
+
+    request_id: str
+    """Request ID for correlation"""
+
+    connector_type: str
+    """Type of connector"""
+
+    source_rank: int
+    """Source rank"""
+
+    dest_rank: int
+    """Destination rank"""
+
+    block_count: int
+    """Number of blocks transferred"""
+
+    success: bool
+    """True if transfer completed successfully"""
+
+
+class CacheLoadCommitted(KVCacheEvent):
+    """Emitted when the scheduler commits to loading from cache.
+
+    Emitted AFTER prepare_load() returns successfully.
+    Ordering: CacheLoadCommitted -> TransferInitiated -> TransferCompleted
+    """
+
+    request_id: str
+    """Request ID for correlation"""
+
+    medium: str
+    """Storage medium being loaded from (CPU, DISK, LMCACHE)"""
+
+    block_count: int
+    """Number of blocks to load"""
+
+    scheduler_step: int
+    """Scheduler step when load was committed"""
+
+
+class CacheStoreCommitted(KVCacheEvent):
+    """Emitted when the scheduler commits to storing to cache.
+
+    Emitted AFTER prepare_store() returns non-None.
+    Ordering: CacheStoreCommitted(step=S) -> TransferInitiated(step=S+1)
+    (stores are deferred by one step to avoid blocking token generation)
+    """
+
+    request_id: str
+    """Request ID for correlation"""
+
+    medium: str
+    """Storage medium being stored to (CPU, DISK, LMCACHE)"""
+
+    block_count: int
+    """Number of blocks to store"""
+
+    scheduler_step: int
+    """Scheduler step when store was committed"""
+
+
+class CacheEviction(KVCacheEvent):
+    """Emitted when blocks are evicted to make room.
+
+    Emitted AFTER prepare_store() returns with non-empty block_hashes_evicted.
+    Emitted BEFORE CacheStoreCommitted in the same step.
+    """
+
+    medium: str
+    """Storage medium where eviction occurred"""
+
+    blocks_evicted: int
+    """Number of blocks evicted"""
+
+    eviction_reason: str
+    """Reason for eviction: 'lru', 'capacity', or 'preemption'"""
+
+    scheduler_step: int
+    """Scheduler step when eviction occurred"""
+
+    block_hashes: list[ExternalBlockHash] | None = None
+    """Optional: hashes of evicted blocks (enabled via VLLM_KV_EVENTS_INCLUDE_HASHES)"""
+
+
+# =============================================================================
+# Transfer ID Generation
+# =============================================================================
+
+
+class TransferIdGenerator:
+    """Generates globally unique transfer IDs for KV cache operations.
+
+    Transfer IDs are encoded as: (emitter_rank << 32) | local_counter
+    This ensures uniqueness across ranks without coordination.
+
+    Usage:
+        generator = TransferIdGenerator(rank=0)
+        transfer_id = generator.next_id()  # Returns 1, 2, 3, ...
+    """
+
+    __slots__ = ("_rank_prefix", "_counter")
+
+    def __init__(self, rank: int = 0) -> None:
+        """Initialize the generator.
+
+        Args:
+            rank: The rank of this process (0-2^31-1). Used as high 32 bits.
+        """
+        if rank < 0 or rank >= (1 << 32):
+            raise ValueError(f"rank must be in [0, 2^32): got {rank}")
+        self._rank_prefix = rank << 32
+        self._counter = 0
+
+    def next_id(self) -> int:
+        """Generate the next transfer ID.
+
+        Returns:
+            Globally unique transfer ID.
+        """
+        self._counter += 1
+        return self._rank_prefix | self._counter
+
+    @staticmethod
+    def extract_rank(transfer_id: int) -> int:
+        """Extract the rank from a transfer ID.
+
+        Args:
+            transfer_id: A transfer ID generated by TransferIdGenerator.
+
+        Returns:
+            The rank that generated this ID.
+        """
+        return transfer_id >> 32
+
+    @staticmethod
+    def extract_counter(transfer_id: int) -> int:
+        """Extract the local counter from a transfer ID.
+
+        Args:
+            transfer_id: A transfer ID generated by TransferIdGenerator.
+
+        Returns:
+            The local counter value.
+        """
+        return transfer_id & 0xFFFFFFFF
+
+
 class KVEventBatch(EventBatch):
-    events: list[BlockStored | BlockRemoved | AllBlocksCleared]
+    """Batch of KV cache events with optional scheduler step correlation.
+
+    The scheduler_step field allows correlating events with journey/step events.
+    For batches containing only remote events (no scheduler_step), this is None.
+    """
+
+    events: list[
+        BlockStored
+        | BlockRemoved
+        | AllBlocksCleared
+        | TransferInitiated
+        | TransferCompleted
+        | RemoteTransferInitiated
+        | RemoteTransferCompleted
+        | CacheLoadCommitted
+        | CacheStoreCommitted
+        | CacheEviction
+    ]
+
+    scheduler_step: int | None = None
+    """Scheduler step for correlation. None for remote-only batches."""
 
 
 class KVEventAggregator:
