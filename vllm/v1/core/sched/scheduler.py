@@ -1200,6 +1200,10 @@ class Scheduler(SchedulerInterface):
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
         if self.connector is not None:
+            # Set scheduler step for event correlation before building metadata
+            # This ensures CacheLoadCommitted/CacheStoreCommitted events have
+            # the correct scheduler_step value
+            self.connector.set_scheduler_step(curr_step)
             meta: KVConnectorMetadata = self.connector.build_connector_meta(
                 scheduler_output
             )

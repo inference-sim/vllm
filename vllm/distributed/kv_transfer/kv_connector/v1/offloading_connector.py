@@ -10,7 +10,19 @@ import torch
 
 from vllm.attention.layer import Attention
 from vllm.config import VllmConfig, get_layers_from_vllm_config
-from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
+from vllm.distributed.kv_events import (
+    BlockRemoved,
+    BlockStored,
+    CacheEviction,
+    CacheLoadCommitted,
+    CacheStoreCommitted,
+    KVCacheEvent,
+    KVConnectorKVEvents,
+    KVEventAggregator,
+    TransferCompleted,
+    TransferIdGenerator,
+    TransferInitiated,
+)
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
@@ -37,10 +49,50 @@ ReqId = str
 logger = init_logger(__name__)
 
 
+class OffloadingKVEvents(KVConnectorKVEvents):
+    """Concrete implementation of KVConnectorKVEvents for offloading connector.
+
+    Collects transfer events (TransferInitiated, TransferCompleted) from
+    the worker side for publishing via the event system.
+    """
+
+    def __init__(self, num_workers: int = 1) -> None:
+        self._aggregator = KVEventAggregator(num_workers)
+
+    def add_events(self, events: list[KVCacheEvent]) -> None:
+        self._aggregator.add_events(events)
+
+    def aggregate(self) -> "OffloadingKVEvents":
+        """Aggregate KV events and retain only common events."""
+        common_events = self._aggregator.get_common_events()
+        self._aggregator.clear_events()
+        self._aggregator.add_events(common_events)
+        self._aggregator.reset_workers()
+        return self
+
+    def increment_workers(self, count: int = 1) -> None:
+        self._aggregator.increment_workers(count)
+
+    def get_all_events(self) -> list[KVCacheEvent]:
+        return self._aggregator.get_all_events()
+
+    def get_number_of_workers(self) -> int:
+        return self._aggregator.get_number_of_workers()
+
+    def clear_events(self) -> None:
+        self._aggregator.clear_events()
+        self._aggregator.reset_workers()
+
+    def __repr__(self) -> str:
+        return f"<OffloadingKVEvents events={self.get_all_events()}>"
+
+
 @dataclass
 class OffloadingConnectorMetadata(KVConnectorMetadata):
     reqs_to_load: dict[ReqId, TransferSpec]
     reqs_to_store: dict[ReqId, TransferSpec]
+    scheduler_step: int = 0
+    """Scheduler step for correlating transfer events."""
 
 
 class OffloadingConnector(KVConnectorBase_V1):
@@ -143,6 +195,31 @@ class OffloadingConnector(KVConnectorBase_V1):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.take_events()
 
+    def set_scheduler_step(self, step: int) -> None:
+        """Set the current scheduler step for event correlation.
+
+        Called by the scheduler before build_connector_meta() to ensure
+        events emitted during this scheduling round have the correct step.
+
+        Args:
+            step: The current scheduler step counter value.
+        """
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.set_scheduler_step(step)
+
+    def get_kv_connector_kv_cache_events(self) -> OffloadingKVEvents | None:
+        """Get the KV connector events collected during the last interval.
+
+        Returns pending worker-side events (TransferInitiated, TransferCompleted)
+        wrapped in an OffloadingKVEvents container for aggregation.
+
+        Returns:
+            OffloadingKVEvents if there are pending events, None otherwise.
+        """
+        if self.connector_worker is not None:
+            return self.connector_worker.get_kv_connector_kv_cache_events()
+        return None
+
 
 class OffloadingConnectorScheduler:
     """Implementation of Scheduler side methods"""
@@ -171,6 +248,10 @@ class OffloadingConnectorScheduler:
         self._reqs_being_stored = defaultdict[ReqId, set[BlockHash]](set)
         self._reqs_being_loaded = defaultdict[ReqId, set[BlockHash]](set)
 
+        # Event tracking for KV cache tracing (Phase 2)
+        self._pending_events: list[KVCacheEvent] = []
+        self._current_scheduler_step: int = 0
+
     def _get_block_hashes(
         self,
         req: Request,
@@ -183,6 +264,17 @@ class OffloadingConnectorScheduler:
             self.block_size_factor * end_idx if end_idx else None,
             self.block_size_factor,
         )
+
+    def set_scheduler_step(self, step: int) -> None:
+        """Set the current scheduler step for event correlation.
+
+        Called by the scheduler before build_connector_meta() to ensure
+        events emitted during this scheduling round have the correct step.
+
+        Args:
+            step: The current scheduler step counter value.
+        """
+        self._current_scheduler_step = step
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -292,6 +384,18 @@ class OffloadingConnectorScheduler:
         src_spec = self.manager.prepare_load(block_hashes)
         dst_spec = GPULoadStoreSpec(block_ids[num_computed_gpu_blocks:])
 
+        # C1: Emit CacheLoadCommitted AFTER prepare_load() returns successfully
+        # C2: block_count = length of input to prepare_load()
+        load_block_count = num_blocks - start_block_idx
+        self._pending_events.append(
+            CacheLoadCommitted(
+                request_id=request.request_id,
+                medium=src_spec.medium(),
+                block_count=load_block_count,
+                scheduler_step=self._current_scheduler_step,
+            )
+        )
+
         block_hashes = self._get_block_hashes(
             request, start_idx=start_block_idx, end_idx=num_blocks
         )
@@ -335,6 +439,7 @@ class OffloadingConnectorScheduler:
             )
             store_output = self.manager.prepare_store(new_block_hashes)
             if store_output is None:
+                # C6: prepare_store() returns None -> No CacheStoreCommitted
                 logger.warning(
                     "Request %s: cannot store %s blocks", req_id, num_new_blocks
                 )
@@ -342,8 +447,30 @@ class OffloadingConnectorScheduler:
 
             self._next_stored_block_idx[req_id] = num_blocks
 
+            # C1: Emit events AFTER prepare_store() returns non-None
+            # C9: CacheEviction emitted BEFORE CacheStoreCommitted (same step)
+            if store_output.block_hashes_evicted:
+                self._pending_events.append(
+                    CacheEviction(
+                        medium=store_output.store_spec.medium(),
+                        blocks_evicted=len(store_output.block_hashes_evicted),
+                        eviction_reason="lru",
+                        scheduler_step=self._current_scheduler_step,
+                    )
+                )
+
             if not store_output.block_hashes_to_store:
                 continue
+
+            # C2: block_count = len(store_output.block_hashes_to_store)
+            self._pending_events.append(
+                CacheStoreCommitted(
+                    request_id=req_id,
+                    medium=store_output.store_spec.medium(),
+                    block_count=len(store_output.block_hashes_to_store),
+                    scheduler_step=self._current_scheduler_step,
+                )
+            )
             block_hashes_to_store = set(store_output.block_hashes_to_store)
 
             block_hashes = self._get_block_hashes(req, end_idx=num_blocks)
@@ -381,6 +508,7 @@ class OffloadingConnectorScheduler:
         meta = OffloadingConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
             reqs_to_store=self._get_reqs_to_store(scheduler_output),
+            scheduler_step=self._current_scheduler_step,
         )
         self._reqs_to_load = {}
 
@@ -440,9 +568,19 @@ class OffloadingConnectorScheduler:
     def take_events(self) -> Iterable[KVCacheEvent]:
         """Take the KV cache events from the connector.
 
+        Returns pending scheduler-side events (CacheLoadCommitted,
+        CacheStoreCommitted, CacheEviction) followed by manager events
+        (BlockStored, BlockRemoved).
+
         Returns:
             A list of KV cache events.
         """
+        # Yield pending scheduler-side events first
+        if self._pending_events:
+            yield from self._pending_events
+            self._pending_events = []
+
+        # Then yield manager events (BlockStored, BlockRemoved)
         for event in self.manager.take_events():
             if event.removed:
                 yield BlockRemoved(block_hashes=event.block_hashes, medium=event.medium)
@@ -465,23 +603,27 @@ class OffloadingConnectorWorker:
         self.spec = spec
         self.worker = OffloadingWorker()
 
-        self._job_counter = 0
+        # Transfer ID generator replaces _job_counter
+        # Uses (rank << 32) | counter encoding for global uniqueness
+        self._transfer_id_gen = TransferIdGenerator(rank=0)
 
-        # job_id -> (req_id, store)
+        # transfer_id -> (req_id, is_store)
         self._jobs: dict[int, tuple[ReqId, bool]] = {}
-        # req_id -> active job IDs
+        # req_id -> active transfer IDs
         self._load_job: dict[ReqId, int] = {}
-        # req_id -> set(active job IDs)
+        # req_id -> set(active transfer IDs)
         self._store_jobs = defaultdict[ReqId, set[int]](set)
-        # list of store jobs pending submission (job_id, transfer_spec)
-        self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
+        # list of store jobs pending submission (transfer_id, req_id, transfer_spec)
+        self._unsubmitted_store_jobs: list[tuple[int, ReqId, TransferSpec]] = []
 
         self._finished_reqs_waiting_for_store: set[ReqId] = set()
 
-    def _generate_job_id(self) -> int:
-        job_id = self._job_counter
-        self._job_counter = job_id + 1
-        return job_id
+        # Event tracking for KV cache tracing (Phase 2)
+        self._pending_events: list[KVCacheEvent] = []
+        # transfer_id -> event data for emitting TransferCompleted
+        self._job_to_event_data: dict[int, dict[str, Any]] = {}
+        # Current scheduler step from metadata
+        self._current_scheduler_step: int = 0
 
     def _register_handlers(
         self,
@@ -512,40 +654,117 @@ class OffloadingConnectorWorker:
         attn_backends = {cross_layer_name: attn_backend}
         self._register_handlers(kv_caches, attn_backends)
 
-    def handle_preemptions(self, preempted_req_ids: set[str]):
-        for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
-            assert success
+    def _submit_deferred_stores(self) -> None:
+        """Submit deferred store transfers and emit TransferInitiated events.
+
+        Stores are deferred by one scheduler step (C3) to avoid blocking token
+        generation. This method submits the deferred stores and emits events.
+        """
+        for transfer_id, req_id, transfer_spec in self._unsubmitted_store_jobs:
+            src_spec, dst_spec = transfer_spec
+            success = self.worker.transfer_async(transfer_id, transfer_spec)
+            if success:
+                # C1: Emit TransferInitiated AFTER transfer_async() returns True
+                # C2: block_count = len(src_spec.block_ids)
+                block_count = len(src_spec.block_ids)  # type: ignore[attr-defined]
+                self._pending_events.append(
+                    TransferInitiated(
+                        transfer_id=transfer_id,
+                        request_id=req_id,
+                        source_medium=src_spec.medium(),
+                        dest_medium=dst_spec.medium(),
+                        block_count=block_count,
+                        scheduler_step=self._current_scheduler_step,
+                    )
+                )
+                # Store event data for TransferCompleted
+                self._job_to_event_data[transfer_id] = {
+                    "request_id": req_id,
+                    "source_medium": src_spec.medium(),
+                    "dest_medium": dst_spec.medium(),
+                    "block_count": block_count,
+                    "scheduler_step": self._current_scheduler_step,
+                }
+            else:
+                # C6: transfer_async() returns False -> No TransferInitiated
+                logger.error(
+                    "Failed to submit deferred store transfer for request %s",
+                    req_id,
+                )
+                # Clean up tracking state
+                self._jobs.pop(transfer_id, None)
+                req_jobs = self._store_jobs.get(req_id)
+                if req_jobs:
+                    req_jobs.discard(transfer_id)
         self._unsubmitted_store_jobs.clear()
+
+    def handle_preemptions(self, preempted_req_ids: set[str]):
+        # Submit deferred stores - these are stores prepared in the previous step
+        # C3: Stores are deferred by one step, so TransferInitiated uses current step
+        self._submit_deferred_stores()
 
         for req_id in preempted_req_ids:
-            job_ids = self._store_jobs.get(req_id)
-            if job_ids:
-                self.worker.wait(job_ids)
+            transfer_ids = self._store_jobs.get(req_id)
+            if transfer_ids:
+                self.worker.wait(transfer_ids)
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
-        for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
-            assert success
-        self._unsubmitted_store_jobs.clear()
+        # Update current scheduler step from metadata
+        self._current_scheduler_step = metadata.scheduler_step
 
+        # Submit deferred stores - these are stores prepared in the previous step
+        # C3: Stores are deferred by one step, so TransferInitiated uses current step
+        self._submit_deferred_stores()
+
+        # Submit loads for current step
         for req_id, transfer_spec in metadata.reqs_to_load.items():
-            job_id = self._generate_job_id()
-            self._jobs[job_id] = (req_id, False)
+            src_spec, dst_spec = transfer_spec
+            transfer_id = self._transfer_id_gen.next_id()
+            self._jobs[transfer_id] = (req_id, False)
             assert req_id not in self._load_job
-            self._load_job[req_id] = job_id
-            success = self.worker.transfer_async(job_id, transfer_spec)
-            assert success
+            self._load_job[req_id] = transfer_id
+            success = self.worker.transfer_async(transfer_id, transfer_spec)
+            if success:
+                # C1: Emit TransferInitiated AFTER transfer_async() returns True
+                block_count = len(src_spec.block_ids)  # type: ignore[attr-defined]
+                self._pending_events.append(
+                    TransferInitiated(
+                        transfer_id=transfer_id,
+                        request_id=req_id,
+                        source_medium=src_spec.medium(),
+                        dest_medium=dst_spec.medium(),
+                        block_count=block_count,
+                        scheduler_step=self._current_scheduler_step,
+                    )
+                )
+                # Store event data for TransferCompleted
+                self._job_to_event_data[transfer_id] = {
+                    "request_id": req_id,
+                    "source_medium": src_spec.medium(),
+                    "dest_medium": dst_spec.medium(),
+                    "block_count": block_count,
+                    "scheduler_step": self._current_scheduler_step,
+                }
+            else:
+                # C6: transfer_async() returns False -> No TransferInitiated
+                logger.error(
+                    "Failed to submit load transfer for request %s",
+                    req_id,
+                )
+                # Clean up tracking state
+                self._jobs.pop(transfer_id, None)
+                del self._load_job[req_id]
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         for req_id, transfer_spec in metadata.reqs_to_store.items():
-            job_id = self._generate_job_id()
-            self._jobs[job_id] = (req_id, True)
-            self._store_jobs[req_id].add(job_id)
+            transfer_id = self._transfer_id_gen.next_id()
+            self._jobs[transfer_id] = (req_id, True)
+            self._store_jobs[req_id].add(transfer_id)
             # NOTE(orozery): defer the store to the beginning of the next engine step,
             # so that offloading starts AFTER transfers related to token sampling,
             # thereby avoiding delays to token generation due to offloading.
-            self._unsubmitted_store_jobs.append((job_id, transfer_spec))
+            # C3: Stores are deferred - TransferInitiated emitted in next step
+            self._unsubmitted_store_jobs.append((transfer_id, req_id, transfer_spec))
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """
@@ -559,14 +778,36 @@ class OffloadingConnectorWorker:
         """
         finished_sending = set()
         finished_recving = set()
-        for job_id, success in self.worker.get_finished():
-            # we currently do not support job failures
-            assert success
-            req_id, store = self._jobs.pop(job_id)
+        for transfer_id, success in self.worker.get_finished():
+            # C4: No-Disappear Guarantee - emit TransferCompleted for ALL completions
+            # C1: Emit TransferCompleted AFTER get_finished() returns a job
+            event_data = self._job_to_event_data.pop(transfer_id, None)
+            if event_data:
+                self._pending_events.append(
+                    TransferCompleted(
+                        transfer_id=transfer_id,
+                        request_id=event_data["request_id"],
+                        source_medium=event_data["source_medium"],
+                        dest_medium=event_data["dest_medium"],
+                        block_count=event_data["block_count"],
+                        success=success,
+                        scheduler_step=event_data["scheduler_step"],
+                    )
+                )
+
+            if not success:
+                # C6: get_finished() returns failure -> TransferCompleted(success=False)
+                logger.error(
+                    "Transfer %d failed for request %s",
+                    transfer_id,
+                    event_data["request_id"] if event_data else "unknown",
+                )
+
+            req_id, store = self._jobs.pop(transfer_id)
             if store:
-                req_jobs = self._store_jobs[req_id]
-                req_jobs.remove(job_id)
-                if req_jobs:
+                req_transfers = self._store_jobs[req_id]
+                req_transfers.remove(transfer_id)
+                if req_transfers:
                     continue
 
                 if req_id in self._finished_reqs_waiting_for_store:
@@ -574,17 +815,34 @@ class OffloadingConnectorWorker:
                     finished_sending.add(req_id)
                     del self._store_jobs[req_id]
             else:
-                req_job = self._load_job[req_id]
-                assert job_id == req_job
+                req_transfer = self._load_job[req_id]
+                assert transfer_id == req_transfer
                 del self._load_job[req_id]
                 finished_recving.add(req_id)
 
         for req_id in finished_req_ids:
-            pending_req_jobs = self._store_jobs.get(req_id)
-            if pending_req_jobs:
+            pending_req_transfers = self._store_jobs.get(req_id)
+            if pending_req_transfers:
                 self._finished_reqs_waiting_for_store.add(req_id)
-            elif pending_req_jobs is not None:
+            elif pending_req_transfers is not None:
                 finished_sending.add(req_id)
                 del self._store_jobs[req_id]
 
         return finished_sending, finished_recving
+
+    def get_kv_connector_kv_cache_events(self) -> OffloadingKVEvents | None:
+        """Get the KV connector events collected during the last interval.
+
+        Returns pending worker-side events (TransferInitiated, TransferCompleted)
+        wrapped in an OffloadingKVEvents container for aggregation.
+
+        Returns:
+            OffloadingKVEvents if there are pending events, None otherwise.
+        """
+        if not self._pending_events:
+            return None
+
+        events = OffloadingKVEvents(num_workers=1)
+        events.add_events(self._pending_events)
+        self._pending_events = []
+        return events
