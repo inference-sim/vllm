@@ -115,6 +115,16 @@ class TransferInitiated(KVCacheEvent):
     scheduler_step: int
     """Scheduler step when transfer was initiated"""
 
+    def __hash__(self) -> int:
+        return hash((
+            self.transfer_id,
+            self.request_id,
+            self.source_medium,
+            self.dest_medium,
+            self.block_count,
+            self.scheduler_step,
+        ))
+
 
 class TransferCompleted(KVCacheEvent):
     """Emitted when a DMA transfer finishes (success or failure).
@@ -144,6 +154,17 @@ class TransferCompleted(KVCacheEvent):
     scheduler_step: int
     """Scheduler step when transfer was initiated (for correlation)"""
 
+    def __hash__(self) -> int:
+        return hash((
+            self.transfer_id,
+            self.request_id,
+            self.source_medium,
+            self.dest_medium,
+            self.block_count,
+            self.success,
+            self.scheduler_step,
+        ))
+
 
 class RemoteTransferInitiated(KVCacheEvent):
     """Emitted when a cross-machine transfer starts.
@@ -168,6 +189,16 @@ class RemoteTransferInitiated(KVCacheEvent):
 
     block_count: int
     """Number of blocks being transferred"""
+
+    def __hash__(self) -> int:
+        return hash((
+            self.transfer_id,
+            self.request_id,
+            self.connector_type,
+            self.source_rank,
+            self.dest_rank,
+            self.block_count,
+        ))
 
 
 class RemoteTransferCompleted(KVCacheEvent):
@@ -197,6 +228,17 @@ class RemoteTransferCompleted(KVCacheEvent):
     success: bool
     """True if transfer completed successfully"""
 
+    def __hash__(self) -> int:
+        return hash((
+            self.transfer_id,
+            self.request_id,
+            self.connector_type,
+            self.source_rank,
+            self.dest_rank,
+            self.block_count,
+            self.success,
+        ))
+
 
 class CacheLoadCommitted(KVCacheEvent):
     """Emitted when the scheduler commits to loading from cache.
@@ -216,6 +258,14 @@ class CacheLoadCommitted(KVCacheEvent):
 
     scheduler_step: int
     """Scheduler step when load was committed"""
+
+    def __hash__(self) -> int:
+        return hash((
+            self.request_id,
+            self.medium,
+            self.block_count,
+            self.scheduler_step,
+        ))
 
 
 class CacheStoreCommitted(KVCacheEvent):
@@ -237,6 +287,14 @@ class CacheStoreCommitted(KVCacheEvent):
 
     scheduler_step: int
     """Scheduler step when store was committed"""
+
+    def __hash__(self) -> int:
+        return hash((
+            self.request_id,
+            self.medium,
+            self.block_count,
+            self.scheduler_step,
+        ))
 
 
 class CacheEviction(KVCacheEvent):
@@ -260,6 +318,15 @@ class CacheEviction(KVCacheEvent):
 
     block_hashes: list[ExternalBlockHash] | None = None
     """Optional: hashes of evicted blocks (enabled via VLLM_KV_EVENTS_INCLUDE_HASHES)"""
+
+    def __hash__(self) -> int:
+        return hash((
+            self.medium,
+            self.blocks_evicted,
+            self.eviction_reason,
+            self.scheduler_step,
+            tuple(self.block_hashes) if self.block_hashes else None,
+        ))
 
 
 # =============================================================================

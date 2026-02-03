@@ -469,6 +469,20 @@ class KVConnectorBase_V1(ABC):
         """
         pass
 
+    def set_scheduler_step(self, step: int) -> None:
+        """Set the current scheduler step for event correlation.
+
+        Called by the scheduler before build_connector_meta() to ensure
+        events emitted during this scheduling round have the correct step.
+
+        This method is used by connectors that emit KV cache tracing events.
+        The default implementation does nothing.
+
+        Args:
+            step: The current scheduler step counter value.
+        """
+        pass
+
     @abstractmethod
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput

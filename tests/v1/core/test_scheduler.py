@@ -3454,7 +3454,7 @@ def test_tracer_init_when_endpoint_set(mock_init_tracer):
     )
 
     # Verify tracer was set
-    assert scheduler.tracer is mock_tracer, (
+    assert scheduler.journey_tracer is mock_tracer, (
         "Tracer should be set to the mock tracer returned by init_tracer"
     )
 
@@ -3466,7 +3466,7 @@ def test_tracer_none_when_endpoint_not_set():
         enable_journey_tracing=True,
         otlp_traces_endpoint=None
     )
-    assert scheduler1.tracer is None, (
+    assert scheduler1.journey_tracer is None, (
         "Tracer should be None when endpoint not configured"
     )
 
@@ -3475,7 +3475,7 @@ def test_tracer_none_when_endpoint_not_set():
         enable_journey_tracing=False,
         otlp_traces_endpoint="http://localhost:4317"
     )
-    assert scheduler2.tracer is None, (
+    assert scheduler2.journey_tracer is None, (
         "Tracer should be None when journey tracing disabled"
     )
 
@@ -3484,7 +3484,7 @@ def test_tracer_none_when_endpoint_not_set():
         enable_journey_tracing=False,
         otlp_traces_endpoint=None
     )
-    assert scheduler3.tracer is None, (
+    assert scheduler3.journey_tracer is None, (
         "Tracer should be None when both disabled"
     )
 
@@ -3505,8 +3505,8 @@ def test_scheduler_init_succeeds_with_tracing_enabled(mock_init_tracer):
     )
 
     assert scheduler is not None, "Scheduler should initialize successfully"
-    assert hasattr(scheduler, 'tracer'), "Scheduler should have tracer attribute"
-    assert scheduler.tracer is mock_tracer, "Tracer should be set to mock"
+    assert hasattr(scheduler, 'journey_tracer'), "Scheduler should have journey_tracer attribute"
+    assert scheduler.journey_tracer is mock_tracer, "Tracer should be set to mock"
 
 
 @patch('vllm.tracing.init_tracer', side_effect=Exception("Init failed"))
@@ -3526,7 +3526,7 @@ def test_tracer_init_handles_failure_gracefully(mock_init_tracer):
     )
 
     # Tracer should be None (init failed)
-    assert scheduler.tracer is None, (
+    assert scheduler.journey_tracer is None, (
         "Tracer should be None when initialization fails"
     )
 
@@ -3674,7 +3674,7 @@ def test_no_span_leak_when_tracer_none():
     )
 
     # Verify tracer is None
-    assert scheduler.tracer is None
+    assert scheduler.journey_tracer is None
 
     requests = create_requests(num_requests=5)
     for request in requests:
@@ -3719,9 +3719,11 @@ def test_parent_context_extraction(mock_extract_context, mock_init_tracer):
     # Create request with trace_headers (valid W3C traceparent format)
     # Format: version-trace_id-parent_id-flags
     # trace_id: 32 hex chars, parent_id: 16 hex chars
+    # Must include x-vllm-journey-sampled header for scheduler to create span
     trace_headers = {
         "traceparent": "00-1234567890abcdef1234567890abcdef-fedcba9876543210-01",
-        "tracestate": "vendor=value"
+        "tracestate": "vendor=value",
+        "x-vllm-journey-sampled": "1",  # Required for scheduler to create core span
     }
 
     sampling_params = SamplingParams(max_tokens=10)
@@ -3955,7 +3957,7 @@ def test_events_emitted_to_span():
     mock_span.is_recording.return_value = True
 
     scheduler = create_scheduler(enable_journey_tracing=True)
-    scheduler.tracer = Mock()  # CRITICAL: ensures _create_core_span is called
+    scheduler.journey_tracer = Mock()  # CRITICAL: ensures _create_core_span is called
 
     with patch.object(scheduler, '_create_core_span', return_value=mock_span):
         request = create_requests(num_requests=1)[0]
@@ -3980,7 +3982,7 @@ def test_event_attributes_complete():
     mock_span.is_recording.return_value = True
 
     scheduler = create_scheduler(enable_journey_tracing=True)
-    scheduler.tracer = Mock()  # CRITICAL: ensures span creation
+    scheduler.journey_tracer = Mock()  # CRITICAL: ensures span creation
 
     with patch.object(scheduler, '_create_core_span', return_value=mock_span):
         request = create_requests(num_requests=1)[0]
@@ -4018,7 +4020,7 @@ def test_defensive_error_handling():
     mock_span.add_event.side_effect = Exception("OTEL backend unavailable")
 
     scheduler = create_scheduler(enable_journey_tracing=True)
-    scheduler.tracer = Mock()  # CRITICAL: ensures span creation
+    scheduler.journey_tracer = Mock()  # CRITICAL: ensures span creation
 
     with patch.object(scheduler, '_create_core_span', return_value=mock_span):
         # This should NOT raise despite add_event failing
@@ -4038,7 +4040,7 @@ def test_first_token_dedup_set():
     mock_span.is_recording.return_value = True
 
     scheduler = create_scheduler(enable_journey_tracing=True)
-    scheduler.tracer = Mock()  # CRITICAL: ensures span creation
+    scheduler.journey_tracer = Mock()  # CRITICAL: ensures span creation
 
     with patch.object(scheduler, '_create_core_span', return_value=mock_span):
         request = create_requests(num_requests=1)[0]
@@ -4085,7 +4087,7 @@ def test_first_token_transition_emitted():
     mock_span.is_recording.return_value = True
 
     scheduler = create_scheduler(enable_journey_tracing=True)
-    scheduler.tracer = Mock()  # CRITICAL: ensures span creation
+    scheduler.journey_tracer = Mock()  # CRITICAL: ensures span creation
 
     with patch.object(scheduler, '_create_core_span', return_value=mock_span):
         request = create_requests(num_requests=1)[0]
@@ -4137,7 +4139,7 @@ def test_finished_emitted_to_span():
     mock_span.is_recording.return_value = True
 
     scheduler = create_scheduler(enable_journey_tracing=True)
-    scheduler.tracer = Mock()  # CRITICAL: ensures span creation
+    scheduler.journey_tracer = Mock()  # CRITICAL: ensures span creation
 
     with patch.object(scheduler, '_create_core_span', return_value=mock_span):
         request = create_requests(num_requests=1)[0]
@@ -4196,7 +4198,7 @@ def test_preempted_event_emitted():
     mock_span.is_recording.return_value = True
 
     scheduler = create_scheduler(enable_journey_tracing=True)
-    scheduler.tracer = Mock()  # CRITICAL: ensures span creation
+    scheduler.journey_tracer = Mock()  # CRITICAL: ensures span creation
 
     with patch.object(scheduler, '_create_core_span', return_value=mock_span):
         request = create_requests(num_requests=1)[0]
