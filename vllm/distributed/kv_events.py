@@ -392,6 +392,159 @@ class TransferIdGenerator:
         return transfer_id & 0xFFFFFFFF
 
 
+# =============================================================================
+# Connector Type Constants (for remote transfers)
+# =============================================================================
+
+CONNECTOR_TYPE_NIXL = "NIXL"
+CONNECTOR_TYPE_P2P = "P2P"
+CONNECTOR_TYPE_MOONCAKE = "MOONCAKE"
+
+
+# =============================================================================
+# Remote Transfer Event Tracking Mixin
+# =============================================================================
+
+
+class RemoteTransferEventTracker:
+    """Mixin class for tracking remote transfer events in KV connectors.
+
+    Provides helper methods for emitting RemoteTransferInitiated and
+    RemoteTransferCompleted events. Designed to be mixed into connector
+    worker classes (NixlConnectorWorker, P2pNcclConnector).
+
+    Usage:
+        class MyConnectorWorker(RemoteTransferEventTracker):
+            def __init__(self):
+                self._init_remote_transfer_events(rank=0, connector_type="NIXL")
+
+            def do_transfer(self, request_id, ...):
+                transfer_id = self._emit_remote_transfer_initiated(
+                    request_id=request_id,
+                    source_rank=remote_rank,
+                    dest_rank=self.rank,
+                    block_count=len(block_ids),
+                )
+                try:
+                    # ... do transfer ...
+                    self._emit_remote_transfer_completed(request_id, success=True)
+                except Exception:
+                    self._emit_remote_transfer_completed(request_id, success=False)
+                    raise
+
+    Behavioral Requirements:
+        - _emit_remote_transfer_initiated MUST store metadata keyed by request_id
+        - _emit_remote_transfer_completed MUST copy all fields from stored metadata
+        - _emit_remote_transfer_completed MUST be idempotent (no-op if no Initiated)
+        - transfer_id MUST be generated using TransferIdGenerator with worker's rank
+    """
+
+    def _init_remote_transfer_events(
+        self,
+        rank: int,
+        connector_type: str,
+    ) -> None:
+        """Initialize remote transfer event tracking state.
+
+        Must be called during worker initialization (not scheduler).
+
+        Args:
+            rank: The rank of this worker for transfer ID generation.
+            connector_type: One of CONNECTOR_TYPE_NIXL, CONNECTOR_TYPE_P2P, etc.
+        """
+        self._remote_transfer_id_gen = TransferIdGenerator(rank=rank)
+        self._remote_connector_type = connector_type
+        self._remote_pending_events: list[
+            RemoteTransferInitiated | RemoteTransferCompleted
+        ] = []
+        # request_id -> event metadata for emitting Completed event
+        self._remote_initiated_metadata: dict[str, dict[str, int | str]] = {}
+
+    def _emit_remote_transfer_initiated(
+        self,
+        request_id: str,
+        source_rank: int,
+        dest_rank: int,
+        block_count: int,
+    ) -> int:
+        """Emit a RemoteTransferInitiated event.
+
+        Stores metadata keyed by request_id for later Completed event emission.
+
+        Args:
+            request_id: The request ID for correlation.
+            source_rank: Source rank in distributed setup.
+            dest_rank: Destination rank.
+            block_count: Number of blocks being transferred.
+
+        Returns:
+            The generated transfer_id for this transfer.
+        """
+        transfer_id = self._remote_transfer_id_gen.next_id()
+
+        event = RemoteTransferInitiated(
+            transfer_id=transfer_id,
+            request_id=request_id,
+            connector_type=self._remote_connector_type,
+            source_rank=source_rank,
+            dest_rank=dest_rank,
+            block_count=block_count,
+        )
+        self._remote_pending_events.append(event)
+
+        # Store metadata for Completed event (C4: No-Disappear guarantee)
+        self._remote_initiated_metadata[request_id] = {
+            "transfer_id": transfer_id,
+            "source_rank": source_rank,
+            "dest_rank": dest_rank,
+            "block_count": block_count,
+        }
+
+        return transfer_id
+
+    def _emit_remote_transfer_completed(
+        self,
+        request_id: str,
+        success: bool,
+    ) -> None:
+        """Emit a RemoteTransferCompleted event.
+
+        Uses stored metadata from the corresponding Initiated event.
+        Idempotent: no-op if no matching Initiated event exists.
+
+        Args:
+            request_id: The request ID for correlation.
+            success: True if transfer completed successfully.
+        """
+        metadata = self._remote_initiated_metadata.pop(request_id, None)
+        if metadata is None:
+            # No matching Initiated event - this is a no-op (idempotent behavior)
+            return
+
+        event = RemoteTransferCompleted(
+            transfer_id=metadata["transfer_id"],  # type: ignore[arg-type]
+            request_id=request_id,
+            connector_type=self._remote_connector_type,
+            source_rank=metadata["source_rank"],  # type: ignore[arg-type]
+            dest_rank=metadata["dest_rank"],  # type: ignore[arg-type]
+            block_count=metadata["block_count"],  # type: ignore[arg-type]
+            success=success,
+        )
+        self._remote_pending_events.append(event)
+
+    def _take_remote_transfer_events(
+        self,
+    ) -> list[RemoteTransferInitiated | RemoteTransferCompleted]:
+        """Take and clear pending remote transfer events.
+
+        Returns:
+            List of pending events, then clears the internal list.
+        """
+        events = self._remote_pending_events
+        self._remote_pending_events = []
+        return events
+
+
 class KVEventBatch(EventBatch):
     """Batch of KV cache events with optional scheduler step correlation.
 

@@ -8,6 +8,13 @@ import regex as re
 import torch
 
 from vllm.config import VllmConfig
+from vllm.distributed.kv_events import (
+    CONNECTOR_TYPE_P2P,
+    KVCacheEvent,
+    KVConnectorKVEvents,
+    KVEventAggregator,
+    RemoteTransferEventTracker,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
@@ -71,7 +78,45 @@ class P2pNcclConnectorMetadata(KVConnectorMetadata):
         )
 
 
-class P2pNcclConnector(KVConnectorBase_V1):
+class P2pNcclKVEvents(KVConnectorKVEvents):
+    """KV events container for P2P NCCL connector.
+
+    Collects RemoteTransferInitiated and RemoteTransferCompleted events
+    from P2P transfers for publishing via the event system.
+    """
+
+    def __init__(self, num_workers: int = 1) -> None:
+        self._aggregator = KVEventAggregator(num_workers)
+
+    def add_events(self, events: list[KVCacheEvent]) -> None:
+        self._aggregator.add_events(events)
+
+    def aggregate(self) -> "P2pNcclKVEvents":
+        """Aggregate KV events and retain only common events."""
+        common_events = self._aggregator.get_common_events()
+        self._aggregator.clear_events()
+        self._aggregator.add_events(common_events)
+        self._aggregator.reset_workers()
+        return self
+
+    def increment_workers(self, count: int = 1) -> None:
+        self._aggregator.increment_workers(count)
+
+    def get_all_events(self) -> list[KVCacheEvent]:
+        return self._aggregator.get_all_events()
+
+    def get_number_of_workers(self) -> int:
+        return self._aggregator.get_number_of_workers()
+
+    def clear_events(self) -> None:
+        self._aggregator.clear_events()
+        self._aggregator.reset_workers()
+
+    def __repr__(self) -> str:
+        return f"<P2pNcclKVEvents events={self.get_all_events()}>"
+
+
+class P2pNcclConnector(KVConnectorBase_V1, RemoteTransferEventTracker):
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -103,6 +148,17 @@ class P2pNcclConnector(KVConnectorBase_V1):
             if role == KVConnectorRole.WORKER
             else None
         )
+
+        # Remote transfer event tracking (Phase 3)
+        # Only initialize on worker side
+        if role == KVConnectorRole.WORKER:
+            self._init_remote_transfer_events(
+                rank=self._rank,
+                connector_type=CONNECTOR_TYPE_P2P,
+            )
+            # Track producer requests that have had Initiated events emitted
+            # (to emit exactly once per request across multiple layers)
+            self._producer_reqs_with_initiated_events: set[str] = set()
 
     # ==============================
     # Worker-side methods
@@ -204,28 +260,60 @@ class P2pNcclConnector(KVConnectorBase_V1):
             request_id = request.request_id
             ip, port = self.parse_request_id(request_id, False)
             remote_address = ip + ":" + str(port + self._rank)
-            for layer_name in forward_context.no_compile_layers:
-                layer = forward_context.no_compile_layers[layer_name]
 
-                # Only process layers that have kv_cache
-                # attribute (attention layers) Skip non-attention
-                # layers like FusedMoE
-                kv_cache = getattr(layer, "kv_cache", None)
-                if kv_cache is None:
-                    continue
+            # C1b: Emit RemoteTransferInitiated BEFORE recv loop (bracket)
+            # NOTE: source_rank uses simplified value (0) because P2P connector
+            # doesn't track the actual remote producer rank. The remote_address
+            # contains the real endpoint info. Future improvement: extract actual
+            # rank from remote_address or request metadata.
+            block_count = len(request.block_ids)
+            self._emit_remote_transfer_initiated(
+                request_id=request_id,
+                source_rank=0,  # Simplified: actual producer rank not tracked
+                dest_rank=self._rank,
+                block_count=block_count,
+            )
 
-                layer = kv_cache[forward_context.virtual_engine]
+            # Track success for this request
+            transfer_success = True
 
-                kv_cache = self.p2p_nccl_engine.recv_tensor(
-                    request.request_id + "#" + layer_name, remote_address
-                )
+            # C4: Use try/finally to guarantee Completed is emitted even on
+            # exceptions (No-Disappear Guarantee)
+            try:
+                for layer_name in forward_context.no_compile_layers:
+                    layer = forward_context.no_compile_layers[layer_name]
 
-                if kv_cache is None:
-                    logger.warning("🚧kv_cache is None, %s", request.request_id)
-                    continue
+                    # Only process layers that have kv_cache
+                    # attribute (attention layers) Skip non-attention
+                    # layers like FusedMoE
+                    kv_cache = getattr(layer, "kv_cache", None)
+                    if kv_cache is None:
+                        continue
 
-                inject_kv_into_layer(
-                    layer, kv_cache, request.block_ids, request.request_id
+                    layer = kv_cache[forward_context.virtual_engine]
+
+                    kv_cache = self.p2p_nccl_engine.recv_tensor(
+                        request.request_id + "#" + layer_name, remote_address
+                    )
+
+                    if kv_cache is None:
+                        logger.warning("🚧kv_cache is None, %s", request.request_id)
+                        transfer_success = False
+                        continue
+
+                    inject_kv_into_layer(
+                        layer, kv_cache, request.block_ids, request.request_id
+                    )
+            except Exception:
+                # C6b: Mark as failure if exception occurs
+                transfer_success = False
+                raise
+            finally:
+                # C1b/C4: Emit RemoteTransferCompleted AFTER recv loop (bracket)
+                # Emitted in finally to guarantee No-Disappear even on exceptions
+                self._emit_remote_transfer_completed(
+                    request_id=request_id,
+                    success=transfer_success,
                 )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -301,6 +389,22 @@ class P2pNcclConnector(KVConnectorBase_V1):
             ip, port = self.parse_request_id(request_id, True)
             remote_address = ip + ":" + str(port + self._rank)
 
+            # C1b: Emit RemoteTransferInitiated on FIRST layer
+            # Emit exactly ONCE per request (across multiple layers)
+            # NOTE: dest_rank uses simplified value (0) because P2P connector
+            # doesn't track the actual remote consumer rank. The remote_address
+            # contains the real endpoint info. Future improvement: extract actual
+            # rank from remote_address or request metadata.
+            if request_id not in self._producer_reqs_with_initiated_events:
+                self._producer_reqs_with_initiated_events.add(request_id)
+                block_count = len(request.block_ids)
+                self._emit_remote_transfer_initiated(
+                    request_id=request_id,
+                    source_rank=self._rank,
+                    dest_rank=0,  # Simplified: actual consumer rank not tracked
+                    block_count=block_count,
+                )
+
             kv_cache = extract_kv_from_layer(kv_layer, request.block_ids)
             self.p2p_nccl_engine.send_tensor(
                 request_id + "#" + layer_name, kv_cache, remote_address
@@ -309,7 +413,26 @@ class P2pNcclConnector(KVConnectorBase_V1):
     def wait_for_save(self):
         if self.is_producer:
             assert self.p2p_nccl_engine is not None
-            self.p2p_nccl_engine.wait_for_sent()
+
+            # C4/C6b: Use try/finally to guarantee Completed is emitted even on
+            # exceptions, and track success based on exception occurrence
+            success = True
+            try:
+                self.p2p_nccl_engine.wait_for_sent()
+            except Exception:
+                # C6b: Mark all pending requests as failed
+                success = False
+                raise
+            finally:
+                # C1b/C4: Emit RemoteTransferCompleted for ALL producer requests
+                # that had Initiated events emitted. Emitted in finally to
+                # guarantee No-Disappear even on exceptions.
+                for request_id in self._producer_reqs_with_initiated_events:
+                    self._emit_remote_transfer_completed(
+                        request_id=request_id,
+                        success=success,
+                    )
+                self._producer_reqs_with_initiated_events.clear()
 
     def get_finished(
         self, finished_req_ids: set[str], **kwargs: Any
@@ -329,6 +452,24 @@ class P2pNcclConnector(KVConnectorBase_V1):
 
         no_compile_layers = self._vllm_config.compilation_config.static_forward_context
         return self.p2p_nccl_engine.get_finished(finished_req_ids, no_compile_layers)
+
+    def get_kv_connector_kv_cache_events(self) -> P2pNcclKVEvents | None:
+        """Get the KV connector events collected during the last interval.
+
+        Returns pending worker-side remote transfer events
+        (RemoteTransferInitiated, RemoteTransferCompleted) wrapped in a
+        P2pNcclKVEvents container for aggregation.
+
+        Returns:
+            P2pNcclKVEvents if there are pending events, None otherwise.
+        """
+        events = self._take_remote_transfer_events()
+        if not events:
+            return None
+
+        kv_events = P2pNcclKVEvents(num_workers=1)
+        kv_events.add_events(events)
+        return kv_events
 
     # ==============================
     # Scheduler-side methods

@@ -45,6 +45,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     PromMetric,
     PromMetricT,
 )
+from vllm.distributed.kv_events import (
+    CONNECTOR_TYPE_NIXL,
+    KVCacheEvent,
+    KVConnectorKVEvents,
+    KVEventAggregator,
+    RemoteTransferEventTracker,
+)
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -846,7 +853,45 @@ class NixlConnectorScheduler:
         )
 
 
-class NixlConnectorWorker:
+class NixlKVEvents(KVConnectorKVEvents):
+    """KV events container for NIXL connector.
+
+    Collects RemoteTransferInitiated and RemoteTransferCompleted events
+    from NIXL transfers for publishing via the event system.
+    """
+
+    def __init__(self, num_workers: int = 1) -> None:
+        self._aggregator = KVEventAggregator(num_workers)
+
+    def add_events(self, events: list[KVCacheEvent]) -> None:
+        self._aggregator.add_events(events)
+
+    def aggregate(self) -> "NixlKVEvents":
+        """Aggregate KV events and retain only common events."""
+        common_events = self._aggregator.get_common_events()
+        self._aggregator.clear_events()
+        self._aggregator.add_events(common_events)
+        self._aggregator.reset_workers()
+        return self
+
+    def increment_workers(self, count: int = 1) -> None:
+        self._aggregator.increment_workers(count)
+
+    def get_all_events(self) -> list[KVCacheEvent]:
+        return self._aggregator.get_all_events()
+
+    def get_number_of_workers(self) -> int:
+        return self._aggregator.get_number_of_workers()
+
+    def clear_events(self) -> None:
+        self._aggregator.clear_events()
+        self._aggregator.reset_workers()
+
+    def __repr__(self) -> str:
+        return f"<NixlKVEvents events={self.get_all_events()}>"
+
+
+class NixlConnectorWorker(RemoteTransferEventTracker):
     """Implementation of Worker side methods"""
 
     def __init__(self, vllm_config: VllmConfig, engine_id: str):
@@ -1026,6 +1071,16 @@ class NixlConnectorWorker:
         self.enforce_compat_hash = self.kv_transfer_config.get_from_extra_config(
             "enforce_handshake_compat", True
         )
+
+        # Remote transfer event tracking (Phase 3)
+        # Initialize with tp_rank; will be updated after register_kv_caches
+        self._init_remote_transfer_events(
+            rank=self.tp_rank,
+            connector_type=CONNECTOR_TYPE_NIXL,
+        )
+        # Track which request_ids have had Initiated events emitted
+        # (to emit exactly once per request, even with multiple handles)
+        self._reqs_with_initiated_events: set[ReqId] = set()
 
     def _nixl_handshake(
         self,
@@ -1921,6 +1976,12 @@ class NixlConnectorWorker:
         done_recving = self._pop_done_transfers(self._recving_transfers)
 
         # add requests that skipped transfer to done_recving
+        # C4: Emit Completed for failed requests that had Initiated emitted
+        for req_id in self._failed_recv_reqs:
+            if req_id in self._reqs_with_initiated_events:
+                self._reqs_with_initiated_events.discard(req_id)
+                # C6b: These are failures, so success=False
+                self._emit_remote_transfer_completed(req_id, success=False)
         done_recving.update(self._failed_recv_reqs)
         self._failed_recv_reqs.clear()
 
@@ -1980,6 +2041,24 @@ class NixlConnectorWorker:
 
         return done_sending, done_recving
 
+    def get_kv_connector_kv_cache_events(self) -> NixlKVEvents | None:
+        """Get the KV connector events collected during the last interval.
+
+        Returns pending worker-side remote transfer events
+        (RemoteTransferInitiated, RemoteTransferCompleted) wrapped in a
+        NixlKVEvents container for aggregation.
+
+        Returns:
+            NixlKVEvents if there are pending events, None otherwise.
+        """
+        events = self._take_remote_transfer_events()
+        if not events:
+            return None
+
+        kv_events = NixlKVEvents(num_workers=1)
+        kv_events.add_events(events)
+        return kv_events
+
     def _get_new_notifs(self) -> set[str]:
         """
         Get req_ids which got a remote xfer message. When multiple consumers
@@ -2034,6 +2113,9 @@ class NixlConnectorWorker:
             set of req_ids that have all done xfers
         """
         done_req_ids: set[str] = set()
+        # Track requests with any failed handles (C6b: success=False if ANY fails)
+        failed_req_ids: set[str] = set()
+
         for req_id, handles in list(transfers.items()):
             in_progress = []
             for handle in handles:
@@ -2048,6 +2130,8 @@ class NixlConnectorWorker:
                         in_progress.append(handle)
                         continue
                     else:
+                        # C6b: Transfer failed - mark for failure
+                        failed_req_ids.add(req_id)
                         self._log_failure(
                             failure_type="transfer_failed",
                             msg="Marking blocks as invalid",
@@ -2056,6 +2140,8 @@ class NixlConnectorWorker:
                         )
                         self._handle_failed_transfer(req_id, handle)
                 except Exception as e:
+                    # C6b: Exception during transfer - mark for failure
+                    failed_req_ids.add(req_id)
                     self._log_failure(
                         failure_type="transfer_exception",
                         msg="Marking blocks as invalid",
@@ -2068,6 +2154,14 @@ class NixlConnectorWorker:
                 # Only report request as completed when all transfers are done.
                 done_req_ids.add(req_id)
                 del transfers[req_id]
+
+                # C1b/C4: Emit RemoteTransferCompleted when ALL handles complete
+                # Only emit if we previously emitted Initiated for this request
+                if req_id in self._reqs_with_initiated_events:
+                    self._reqs_with_initiated_events.discard(req_id)
+                    # C6b: success=False if ANY handle failed
+                    success = req_id not in failed_req_ids
+                    self._emit_remote_transfer_completed(req_id, success=success)
             else:
                 transfers[req_id] = in_progress
         return done_req_ids
@@ -2349,6 +2443,19 @@ class NixlConnectorWorker:
 
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append(handle)
+
+            # C1b: Emit RemoteTransferInitiated AFTER first successful transfer()
+            # Emit exactly ONCE per request (even if multiple handles/remote_ranks)
+            if request_id not in self._reqs_with_initiated_events:
+                self._reqs_with_initiated_events.add(request_id)
+                meta = self._recving_metadata.get(request_id)
+                block_count = len(meta.local_block_ids) if meta else 0
+                self._emit_remote_transfer_initiated(
+                    request_id=request_id,
+                    source_rank=remote_rank,
+                    dest_rank=self.tp_rank,
+                    block_count=block_count,
+                )
         except Exception as e:
             # mark all (logical) blocks for this request as invalid
             self._log_failure(
