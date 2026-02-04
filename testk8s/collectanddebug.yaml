@@ -27,7 +27,7 @@ spec:
 
       containers:
         - name: vllm
-          image: ghcr.io/inference-sim/vllm:0.4.6
+          image: ghcr.io/inference-sim/vllm:0.6.0
           imagePullPolicy: IfNotPresent
 
           resources:
@@ -49,6 +49,8 @@ spec:
             - "10"
             - "--otlp-traces-endpoint"
             - "http://otel-collector:4318/v1/traces"
+            - "--kv-events-config"
+            - '{"enable_kv_cache_events": true, "publisher": "zmq", "endpoint": "tcp://*:5557", "replay_endpoint": "tcp://*:5558", "topic": "kv-events"}'
             - "--max-model-len"
             - "1024"
             - "--max-num-batched-tokens"
@@ -57,6 +59,10 @@ spec:
           ports:
             - containerPort: 8000
               name: http
+            - containerPort: 5557
+              name: zmq-pub
+            - containerPort: 5558
+              name: zmq-replay
 
           readinessProbe:
             httpGet:
@@ -148,11 +154,37 @@ spec:
           volumeMounts:
             - name: cache
               mountPath: /cache
+            - name: data-storage
+              mountPath: /data
+
+        - name: kv-events-subscriber
+          image: ghcr.io/inference-sim/vllm:0.6.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - python3
+            - examples/online_serving/kv_events_subscriber.py
+          env:
+            - name: VLLM_KV_EVENTS_SUB_ADDR
+              value: "tcp://localhost:5557"
+            - name: VLLM_KV_EVENTS_REPLAY_ADDR
+              value: "tcp://localhost:5558"
+            - name: VLLM_KV_EVENTS_OUTPUT_FILE
+              value: "/data/kv_events.jsonl"
+          volumeMounts:
+            - name: data-storage
+              mountPath: /data
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
 
       volumes:
         - name: cache
           persistentVolumeClaim:
             claimName: vllm-cache-pvc
+        - name: data-storage
+          persistentVolumeClaim:
+            claimName: data-pvc
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -176,6 +208,12 @@ spec:
     - name: http
       port: 8000
       targetPort: 8000
+    - name: zmq-pub
+      port: 5557
+      targetPort: 5557
+    - name: zmq-replay
+      port: 5558
+      targetPort: 5558
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -279,25 +317,33 @@ spec:
       port: 4318
       targetPort: 4318
 ---
-# This configuration demonstrates step tracing and journey tracing in Kubernetes
-# with traces exported to a file for debugging.
+# This configuration demonstrates step tracing, journey tracing, and KV cache
+# events in Kubernetes with traces and events exported to files for debugging.
 #
 # Key features:
 # - Step tracing with high sampling (10% batch, 10% rich) for debugging
 # - Fast span closure (every 10 steps) for quick test iteration
+# - KV cache events via ZMQ with sidecar subscriber writing JSONL
 # - File exporter writes traces to persistent volume for extraction
 # - Debug pod allows easy trace file access via kubectl cp
 #
-# To extract and view traces:
+# To extract and view data:
 # 1. Deploy: kubectl apply -f testk8s/collectanddebug.yaml
 # 2. Send requests to vLLM server
 # 3. Wait ~15 seconds for traces to export
-# 4. Extract: kubectl cp pvc-debug:/mnt/data/traces.json ./traces.json
-# 5. View: jq '.' traces.json
+# 4. Extract OTEL traces: kubectl cp pvc-debug:/mnt/data/traces.json ./traces.json
+# 5. Extract KV events:   kubectl cp pvc-debug:/mnt/data/kv_events.jsonl ./kv_events.jsonl
+# 6. View traces: jq '.' traces.json
+# 7. View KV events: cat kv_events.jsonl | head
 #
 # Expected spans in traces.json:
 # - Journey tracing: llm_core spans (one per request)
 # - Step tracing: scheduler_steps_1, scheduler_steps_2, etc. (one per 10 steps)
+#
+# Expected events in kv_events.jsonl:
+# - BlockStored: KV cache blocks added
+# - BlockRemoved: KV cache blocks evicted
+# - Transfer events: Local/remote KV cache transfers (if offloading enabled)
 #
 apiVersion: v1
 kind: Pod
