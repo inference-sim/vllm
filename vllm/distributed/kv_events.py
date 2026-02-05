@@ -796,6 +796,19 @@ class ZmqEventPublisher(EventPublisher):
             raise RuntimeError("Publisher is closed")
         if events.data_parallel_rank is None:
             events.data_parallel_rank = self._data_parallel_rank
+
+        # Log event batch summary at debug level
+        if isinstance(events, KVEventBatch) and events.events:
+            event_counts: dict[str, int] = {}
+            for e in events.events:
+                event_type = type(e).__name__
+                event_counts[event_type] = event_counts.get(event_type, 0) + 1
+            logger.debug(
+                "ZMQ publishing %d KV events: %s",
+                len(events.events),
+                event_counts,
+            )
+
         self._event_queue.put(events)
 
     def shutdown(self) -> None:

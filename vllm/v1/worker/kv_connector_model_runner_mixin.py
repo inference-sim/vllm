@@ -108,6 +108,13 @@ class KVConnectorModelRunnerMixin:
             output.kv_connector_stats = kv_connector.get_kv_connector_stats()
             output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
 
+            if output.kv_cache_events is not None:
+                logger.debug(
+                    "KVConnectorModelRunnerMixin: worker events extracted, "
+                    "kv_cache_events=%s",
+                    output.kv_cache_events,
+                )
+
             kv_connector.clear_connector_metadata()
 
     @staticmethod

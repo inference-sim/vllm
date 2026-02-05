@@ -8,10 +8,13 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
 )
+from vllm.logger import init_logger
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.kv_cache_interface import KVCacheConfig
+
+logger = init_logger(__name__)
 
 _KV_CONNECTOR_AGENT: KVConnectorBaseType | None = None
 
@@ -24,7 +27,11 @@ def get_kv_transfer_group() -> KVConnectorBaseType:
 
 
 def has_kv_transfer_group() -> bool:
-    return _KV_CONNECTOR_AGENT is not None
+    result = _KV_CONNECTOR_AGENT is not None
+    # Only log at debug level to avoid spam during model execution
+    if not result:
+        logger.debug("has_kv_transfer_group() returning False - no WORKER connector")
+    return result
 
 
 def is_v1_kv_transfer_group(connector: KVConnectorBaseType | None = None) -> bool:
@@ -57,17 +64,41 @@ def ensure_kv_transfer_initialized(
 
     global _KV_CONNECTOR_AGENT
 
+    logger.debug(
+        "ensure_kv_transfer_initialized called: "
+        "kv_transfer_config=%s, _KV_CONNECTOR_AGENT=%s",
+        vllm_config.kv_transfer_config,
+        _KV_CONNECTOR_AGENT,
+    )
+
     if vllm_config.kv_transfer_config is None:
+        logger.debug("kv_transfer_config is None, returning early")
         return
 
-    if (
-        vllm_config.kv_transfer_config.is_kv_transfer_instance
-        and _KV_CONNECTOR_AGENT is None
-    ):
+    is_kv_instance = vllm_config.kv_transfer_config.is_kv_transfer_instance
+    logger.debug(
+        "is_kv_transfer_instance=%s, _KV_CONNECTOR_AGENT is None=%s",
+        is_kv_instance,
+        _KV_CONNECTOR_AGENT is None,
+    )
+
+    if is_kv_instance and _KV_CONNECTOR_AGENT is None:
+        logger.info(
+            "Creating WORKER KV connector for kv_connector=%s",
+            vllm_config.kv_transfer_config.kv_connector,
+        )
         _KV_CONNECTOR_AGENT = KVConnectorFactory.create_connector(
             config=vllm_config,
             role=KVConnectorRole.WORKER,
             kv_cache_config=kv_cache_config,
+        )
+        logger.info("WORKER KV connector created successfully")
+    else:
+        logger.debug(
+            "Skipping WORKER connector creation: "
+            "is_kv_instance=%s, already_exists=%s",
+            is_kv_instance,
+            _KV_CONNECTOR_AGENT is not None,
         )
 
 

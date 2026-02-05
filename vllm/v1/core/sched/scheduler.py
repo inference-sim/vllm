@@ -94,25 +94,49 @@ def collect_kv_events(
         Combined list of events, or None if no events from any source.
     """
     events = kv_cache_manager_events
+    kv_manager_count = len(kv_cache_manager_events) if kv_cache_manager_events else 0
 
     # Add connector scheduler-side events
+    scheduler_event_count = 0
     if connector_events:
+        connector_events_list = list(connector_events)
+        scheduler_event_count = len(connector_events_list)
         if events is None:
-            events = list(connector_events)
+            events = connector_events_list
         else:
-            events.extend(connector_events)
+            events.extend(connector_events_list)
 
     # Add connector worker-side events (TransferInitiated, TransferCompleted)
+    worker_event_count = 0
     if (kv_connector_output is not None
             and kv_connector_output.kv_cache_events is not None):
         worker_events = kv_connector_output.kv_cache_events.get_all_events()
         if worker_events:
+            worker_event_count = len(worker_events)
             if events is None:
                 events = list(worker_events)
             else:
                 events.extend(worker_events)
             # Clear worker events after extraction to prevent duplicate publishing
             kv_connector_output.kv_cache_events.clear_events()
+
+    # Log event collection summary at debug level
+    total_count = kv_manager_count + scheduler_event_count + worker_event_count
+    if total_count > 0:
+        logger.debug(
+            "collect_kv_events: kv_manager=%d, scheduler=%d, worker=%d, total=%d",
+            kv_manager_count,
+            scheduler_event_count,
+            worker_event_count,
+            total_count,
+        )
+    elif kv_connector_output is not None:
+        # Log when we expected worker events but got none
+        logger.debug(
+            "collect_kv_events: no events collected "
+            "(kv_connector_output.kv_cache_events=%s)",
+            kv_connector_output.kv_cache_events,
+        )
 
     return events
 
@@ -1874,6 +1898,11 @@ class Scheduler(SchedulerInterface):
         if events:
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
+            logger.debug(
+                "Published %d KV events: %s",
+                len(events),
+                {type(e).__name__: sum(1 for ev in events if type(ev).__name__ == type(e).__name__) for e in events},
+            )
 
         # Create EngineCoreOutputs for all clients that have requests with
         # outputs in this step.

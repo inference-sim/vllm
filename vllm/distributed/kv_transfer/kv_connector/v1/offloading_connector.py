@@ -450,10 +450,17 @@ class OffloadingConnectorScheduler:
             # C1: Emit events AFTER prepare_store() returns non-None
             # C9: CacheEviction emitted BEFORE CacheStoreCommitted (same step)
             if store_output.block_hashes_evicted:
+                evicted_count = len(store_output.block_hashes_evicted)
+                logger.debug(
+                    "CacheEviction: medium=%s, blocks_evicted=%d, step=%d",
+                    store_output.store_spec.medium(),
+                    evicted_count,
+                    self._current_scheduler_step,
+                )
                 self._pending_events.append(
                     CacheEviction(
                         medium=store_output.store_spec.medium(),
-                        blocks_evicted=len(store_output.block_hashes_evicted),
+                        blocks_evicted=evicted_count,
                         eviction_reason="lru",
                         scheduler_step=self._current_scheduler_step,
                     )
@@ -463,11 +470,19 @@ class OffloadingConnectorScheduler:
                 continue
 
             # C2: block_count = len(store_output.block_hashes_to_store)
+            block_count = len(store_output.block_hashes_to_store)
+            logger.debug(
+                "CacheStoreCommitted: req=%s, medium=%s, blocks=%d, step=%d",
+                req_id,
+                store_output.store_spec.medium(),
+                block_count,
+                self._current_scheduler_step,
+            )
             self._pending_events.append(
                 CacheStoreCommitted(
                     request_id=req_id,
                     medium=store_output.store_spec.medium(),
-                    block_count=len(store_output.block_hashes_to_store),
+                    block_count=block_count,
                     scheduler_step=self._current_scheduler_step,
                 )
             )
@@ -577,6 +592,15 @@ class OffloadingConnectorScheduler:
         """
         # Yield pending scheduler-side events first
         if self._pending_events:
+            event_counts: dict[str, int] = {}
+            for e in self._pending_events:
+                event_type = type(e).__name__
+                event_counts[event_type] = event_counts.get(event_type, 0) + 1
+            logger.debug(
+                "OffloadingConnectorScheduler.take_events: yielding %d events: %s",
+                len(self._pending_events),
+                event_counts,
+            )
             yield from self._pending_events
             self._pending_events = []
 
@@ -660,6 +684,13 @@ class OffloadingConnectorWorker:
         Stores are deferred by one scheduler step (C3) to avoid blocking token
         generation. This method submits the deferred stores and emits events.
         """
+        if self._unsubmitted_store_jobs:
+            logger.debug(
+                "Submitting %d deferred store jobs at scheduler_step=%d",
+                len(self._unsubmitted_store_jobs),
+                self._current_scheduler_step,
+            )
+
         for transfer_id, req_id, transfer_spec in self._unsubmitted_store_jobs:
             src_spec, dst_spec = transfer_spec
             success = self.worker.transfer_async(transfer_id, transfer_spec)
@@ -667,6 +698,16 @@ class OffloadingConnectorWorker:
                 # C1: Emit TransferInitiated AFTER transfer_async() returns True
                 # C2: block_count = len(src_spec.block_ids)
                 block_count = len(src_spec.block_ids)  # type: ignore[attr-defined]
+                logger.debug(
+                    "TransferInitiated: transfer_id=%d, req=%s, %s->%s, "
+                    "blocks=%d, step=%d",
+                    transfer_id,
+                    req_id,
+                    src_spec.medium(),
+                    dst_spec.medium(),
+                    block_count,
+                    self._current_scheduler_step,
+                )
                 self._pending_events.append(
                     TransferInitiated(
                         transfer_id=transfer_id,
@@ -783,6 +824,17 @@ class OffloadingConnectorWorker:
             # C1: Emit TransferCompleted AFTER get_finished() returns a job
             event_data = self._job_to_event_data.pop(transfer_id, None)
             if event_data:
+                logger.debug(
+                    "TransferCompleted: transfer_id=%d, req=%s, %s->%s, "
+                    "blocks=%d, success=%s, step=%d",
+                    transfer_id,
+                    event_data["request_id"],
+                    event_data["source_medium"],
+                    event_data["dest_medium"],
+                    event_data["block_count"],
+                    success,
+                    event_data["scheduler_step"],
+                )
                 self._pending_events.append(
                     TransferCompleted(
                         transfer_id=transfer_id,
@@ -840,7 +892,23 @@ class OffloadingConnectorWorker:
             OffloadingKVEvents if there are pending events, None otherwise.
         """
         if not self._pending_events:
+            logger.debug(
+                "OffloadingConnectorWorker.get_kv_connector_kv_cache_events: "
+                "no pending events"
+            )
             return None
+
+        event_counts = {}
+        for e in self._pending_events:
+            event_type = type(e).__name__
+            event_counts[event_type] = event_counts.get(event_type, 0) + 1
+
+        logger.debug(
+            "OffloadingConnectorWorker.get_kv_connector_kv_cache_events: "
+            "returning %d events: %s",
+            len(self._pending_events),
+            event_counts,
+        )
 
         events = OffloadingKVEvents(num_workers=1)
         events.add_events(self._pending_events)
