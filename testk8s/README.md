@@ -122,16 +122,17 @@ KV cache is roughly 6-7GB, holding approximately 170-200K tokens. The separate
 To trigger offloading, exceed the GPU KV cache capacity with concurrent long sequences:
 
 ```bash
-# Generate a ~900 token prompt
+# Generate a ~900 token prompt base
 LONG_PROMPT=$(python3 -c "print('The ' * 450)")
 
 # Send 300 concurrent requests to exceed GPU KV cache capacity
+# Each prompt includes $i to prevent prefix cache hits
 for i in {1..300}; do
   curl -s http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
       "model": "opt-125m",
-      "prompt": "'"$LONG_PROMPT"'",
+      "prompt": "Request '"$i"': '"$LONG_PROMPT"'",
       "max_tokens": 100,
       "temperature": 0.7
     }' > /dev/null &
