@@ -394,6 +394,12 @@ class Worker(WorkerBase):
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
 
+        logger.info(
+            "GPUWorker.initialize_from_config called with "
+            "kv_transfer_config=%s",
+            self.vllm_config.kv_transfer_config,
+        )
+
         # Init kv cache connector here, because it requires
         # `kv_cache_config`.
         # NOTE(Kuntai): This need to be done before `initialize_kv_cache`,
