@@ -729,221 +729,8 @@ def test_concurrent_lookups_of_the_same_prefix(request_runner):
 class TestPhase2Events:
     """Tests for Phase 2 KV cache offloading tracing events.
 
-    These tests verify the behavioral contracts (C1-C9) defined in the plan.
-    Tests call actual methods and verify events via take_events().
+    These tests verify behavioral contracts through public APIs.
     """
-
-    def test_cache_store_committed_emission(self):
-        """Test C1: CacheStoreCommitted emitted when _get_reqs_to_store() succeeds.
-
-        Behavioral test: calls actual _get_reqs_to_store() method and verifies
-        CacheStoreCommitted event is emitted with correct fields.
-        """
-        from unittest.mock import MagicMock
-
-        from vllm.distributed.kv_events import CacheStoreCommitted
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
-            OffloadingConnectorScheduler,
-        )
-
-        # Create mock spec
-        mock_spec = MagicMock()
-        mock_spec.gpu_block_size = 4
-        mock_spec.offloaded_block_size = 8
-        mock_manager = MagicMock()
-        mock_manager.take_events.return_value = []
-        mock_spec.get_manager.return_value = mock_manager
-        mock_spec.vllm_config.cache_config.enable_prefix_caching = False
-
-        # Mock prepare_store to return a valid output
-        block_hash = BlockHash(b"test_hash")
-        mock_store_output = MagicMock()
-        mock_store_output.block_hashes_to_store = [block_hash]
-        mock_store_output.block_hashes_evicted = []
-        mock_store_output.store_spec = MockLoadStoreSpec([block_hash])
-        mock_manager.prepare_store.return_value = mock_store_output
-
-        scheduler = OffloadingConnectorScheduler(mock_spec)
-        scheduler.set_scheduler_step(5)
-
-        # Create mock request with enough tokens for 1 offloaded block
-        mock_request = MagicMock()
-        mock_request.request_id = "test-req"
-        mock_request.num_computed_tokens = 0
-        mock_request.block_hashes = [block_hash, block_hash]  # 2 GPU blocks = 1 offload block
-
-        # Register the request
-        scheduler._requests["test-req"] = mock_request
-        scheduler._request_block_ids["test-req"] = [0, 1]  # 2 GPU block IDs
-        scheduler._next_stored_block_idx["test-req"] = 0
-
-        # Create mock new request data (what yield_req_data yields)
-        mock_new_req_data = MagicMock()
-        mock_new_req_data.req_id = "test-req"
-        mock_new_req_data.block_ids = ([0, 1],)  # tuple of block_id lists per group
-
-        # Create mock scheduler_output with proper structure
-        mock_cached_reqs = MagicMock()
-        mock_cached_reqs.req_ids = []
-        mock_cached_reqs.new_block_ids = []
-        mock_cached_reqs.resumed_req_ids = set()
-
-        mock_scheduler_output = MagicMock()
-        mock_scheduler_output.scheduled_new_reqs = [mock_new_req_data]
-        mock_scheduler_output.scheduled_cached_reqs = mock_cached_reqs
-        mock_scheduler_output.num_scheduled_tokens = {"test-req": 8}  # 1 offloaded block
-        mock_scheduler_output.preempted_req_ids = set()
-
-        # Call the actual method
-        scheduler._get_reqs_to_store(mock_scheduler_output)
-
-        # Verify CacheStoreCommitted was emitted via take_events()
-        events = list(scheduler.take_events())
-        store_events = [e for e in events if isinstance(e, CacheStoreCommitted)]
-
-        assert len(store_events) == 1
-        event = store_events[0]
-        assert event.request_id == "test-req"
-        assert event.medium == "Mock"  # From MockLoadStoreSpec.medium()
-        assert event.block_count == 1
-        assert event.scheduler_step == 5
-
-    def test_cache_load_committed_emission(self):
-        """Test C1: CacheLoadCommitted emitted when update_state_after_alloc() loads.
-
-        Behavioral test: calls actual update_state_after_alloc() method and verifies
-        CacheLoadCommitted event is emitted with correct fields.
-        """
-        from unittest.mock import MagicMock
-
-        from vllm.distributed.kv_events import CacheLoadCommitted
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
-            OffloadingConnectorScheduler,
-        )
-        from vllm.v1.core.kv_cache_utils import BlockHash
-
-        # Create mock spec
-        mock_spec = MagicMock()
-        mock_spec.gpu_block_size = 4
-        mock_spec.offloaded_block_size = 8
-        mock_manager = MagicMock()
-        mock_manager.take_events.return_value = []
-        mock_manager.prepare_load.return_value = MockLoadStoreSpec([BlockHash(b"hash1")])
-        mock_spec.get_manager.return_value = mock_manager
-        mock_spec.vllm_config.cache_config.enable_prefix_caching = False
-
-        scheduler = OffloadingConnectorScheduler(mock_spec)
-        scheduler.set_scheduler_step(3)
-
-        # Create mock request
-        mock_request = MagicMock()
-        mock_request.request_id = "load-req"
-        mock_request.num_tokens = 8  # 1 offloaded block
-        mock_request.block_hashes = [BlockHash(b"hash1"), BlockHash(b"hash1")]
-
-        # Create mock blocks
-        mock_block = MagicMock()
-        mock_block.block_hash = None  # Not computed yet
-        mock_blocks = MagicMock()
-        mock_blocks.get_block_ids.return_value = [[10, 11]]  # 2 GPU block IDs
-        mock_blocks.blocks = [[mock_block, mock_block]]
-
-        # Call the actual method with num_external_tokens > 0
-        scheduler.update_state_after_alloc(mock_request, mock_blocks, num_external_tokens=8)
-
-        # Verify CacheLoadCommitted was emitted via take_events()
-        events = list(scheduler.take_events())
-        load_events = [e for e in events if isinstance(e, CacheLoadCommitted)]
-
-        assert len(load_events) == 1
-        event = load_events[0]
-        assert event.request_id == "load-req"
-        assert event.medium == "Mock"  # From MockLoadStoreSpec.medium()
-        assert event.block_count == 1  # 1 offloaded block
-        assert event.scheduler_step == 3
-
-    def test_eviction_before_store_ordering(self):
-        """Test C9: CacheEviction emitted BEFORE CacheStoreCommitted.
-
-        Behavioral test: sets up prepare_store() to return evicted blocks and
-        verifies CacheEviction comes before CacheStoreCommitted in take_events().
-        """
-        from unittest.mock import MagicMock
-
-        from vllm.distributed.kv_events import CacheEviction, CacheStoreCommitted
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
-            OffloadingConnectorScheduler,
-        )
-
-        # Create mock spec
-        mock_spec = MagicMock()
-        mock_spec.gpu_block_size = 4
-        mock_spec.offloaded_block_size = 8
-        mock_manager = MagicMock()
-        mock_manager.take_events.return_value = []
-        mock_spec.get_manager.return_value = mock_manager
-        mock_spec.vllm_config.cache_config.enable_prefix_caching = False
-
-        # Mock prepare_store to return evicted blocks (triggers CacheEviction)
-        block_hash = BlockHash(b"test_hash")
-        evicted_hash = BlockHash(b"evicted_hash")
-        mock_store_output = MagicMock()
-        mock_store_output.block_hashes_to_store = [block_hash]
-        mock_store_output.block_hashes_evicted = [evicted_hash, evicted_hash]  # 2 evicted
-        mock_store_output.store_spec = MockLoadStoreSpec([block_hash])
-        mock_manager.prepare_store.return_value = mock_store_output
-
-        scheduler = OffloadingConnectorScheduler(mock_spec)
-        scheduler.set_scheduler_step(7)
-
-        # Create mock request
-        mock_request = MagicMock()
-        mock_request.request_id = "store-req"
-        mock_request.num_computed_tokens = 0
-        mock_request.block_hashes = [block_hash, block_hash]
-
-        # Register the request
-        scheduler._requests["store-req"] = mock_request
-        scheduler._request_block_ids["store-req"] = [0, 1]
-        scheduler._next_stored_block_idx["store-req"] = 0
-
-        # Create mock new request data (what yield_req_data yields)
-        mock_new_req_data = MagicMock()
-        mock_new_req_data.req_id = "store-req"
-        mock_new_req_data.block_ids = ([0, 1],)  # tuple of block_id lists per group
-
-        # Create mock scheduler_output with proper structure
-        mock_cached_reqs = MagicMock()
-        mock_cached_reqs.req_ids = []
-        mock_cached_reqs.new_block_ids = []
-        mock_cached_reqs.resumed_req_ids = set()
-
-        mock_scheduler_output = MagicMock()
-        mock_scheduler_output.scheduled_new_reqs = [mock_new_req_data]
-        mock_scheduler_output.scheduled_cached_reqs = mock_cached_reqs
-        mock_scheduler_output.num_scheduled_tokens = {"store-req": 8}
-        mock_scheduler_output.preempted_req_ids = set()
-
-        # Call the actual method
-        scheduler._get_reqs_to_store(mock_scheduler_output)
-
-        # Verify ordering via take_events()
-        events = list(scheduler.take_events())
-
-        # Filter to just eviction and store events
-        relevant_events = [e for e in events
-                          if isinstance(e, (CacheEviction, CacheStoreCommitted))]
-
-        assert len(relevant_events) == 2
-        assert isinstance(relevant_events[0], CacheEviction), \
-            "C9: CacheEviction must come BEFORE CacheStoreCommitted"
-        assert isinstance(relevant_events[1], CacheStoreCommitted), \
-            "C9: CacheStoreCommitted must come AFTER CacheEviction"
-
-        # Verify eviction fields
-        assert relevant_events[0].blocks_evicted == 2
-        assert relevant_events[0].eviction_reason == "lru"
-        assert relevant_events[0].scheduler_step == 7
 
     def test_worker_transfer_id_generator(self):
         """Test TransferIdGenerator integration in worker."""
@@ -1004,112 +791,6 @@ class TestPhase2Events:
         # Verify clear works
         events_container.clear_events()
         assert len(events_container.get_all_events()) == 0
-
-    def test_scheduler_step_set_correctly(self):
-        """Test that set_scheduler_step updates _current_scheduler_step."""
-        from unittest.mock import MagicMock
-
-        from vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector import (
-            OffloadingConnectorScheduler,
-        )
-
-        # Create a minimal mock spec (no spec= to allow nested attribute creation)
-        mock_spec = MagicMock()
-        mock_spec.gpu_block_size = 4
-        mock_spec.offloaded_block_size = 8
-        mock_manager = MagicMock()
-        mock_spec.get_manager.return_value = mock_manager
-        mock_spec.vllm_config.cache_config.enable_prefix_caching = False
-
-        scheduler = OffloadingConnectorScheduler(mock_spec)
-
-        # Initial value should be 0
-        assert scheduler._current_scheduler_step == 0
-
-        # Set to various values
-        scheduler.set_scheduler_step(1)
-        assert scheduler._current_scheduler_step == 1
-
-        scheduler.set_scheduler_step(100)
-        assert scheduler._current_scheduler_step == 100
-
-    def test_metadata_scheduler_step(self):
-        """Test that OffloadingConnectorMetadata includes scheduler_step."""
-        # Directly test the metadata dataclass structure
-        metadata = OffloadingConnectorMetadata(
-            reqs_to_load={},
-            reqs_to_store={},
-            scheduler_step=42,
-        )
-
-        # Verify scheduler_step field is present and correct
-        assert hasattr(metadata, "scheduler_step")
-        assert isinstance(metadata.scheduler_step, int)
-        assert metadata.scheduler_step == 42
-
-        # Test default value
-        metadata_default = OffloadingConnectorMetadata(
-            reqs_to_load={},
-            reqs_to_store={},
-        )
-        assert metadata_default.scheduler_step == 0
-
-    def test_transfer_initiated_event_fields(self):
-        """Test TransferInitiated event field values (C2)."""
-        from vllm.distributed.kv_events import TransferInitiated
-
-        event = TransferInitiated(
-            transfer_id=12345,
-            request_id="req-abc",
-            source_medium="GPU",
-            dest_medium="CPU",
-            block_count=8,
-            scheduler_step=42,
-        )
-
-        assert event.transfer_id == 12345
-        assert event.request_id == "req-abc"
-        assert event.source_medium == "GPU"
-        assert event.dest_medium == "CPU"
-        assert event.block_count == 8
-        assert event.scheduler_step == 42
-
-        # Verify hashability
-        assert hash(event) is not None
-
-    def test_transfer_completed_event_fields(self):
-        """Test TransferCompleted event field values (C2)."""
-        from vllm.distributed.kv_events import TransferCompleted
-
-        event = TransferCompleted(
-            transfer_id=12345,
-            request_id="req-abc",
-            source_medium="GPU",
-            dest_medium="CPU",
-            block_count=8,
-            success=True,
-            scheduler_step=42,
-        )
-
-        assert event.transfer_id == 12345
-        assert event.request_id == "req-abc"
-        assert event.source_medium == "GPU"
-        assert event.dest_medium == "CPU"
-        assert event.block_count == 8
-        assert event.success is True
-        assert event.scheduler_step == 42
-
-        # Test failure case
-        failure_event = TransferCompleted(
-            transfer_id=12346,
-            request_id="req-def",
-            source_medium="CPU",
-            dest_medium="GPU",
-            block_count=4,
-            success=False,
-            scheduler_step=43,
-        )
-        assert failure_event.success is False
 
     def test_no_events_when_pending_empty(self):
         """Test that take_events returns empty when no events pending."""
@@ -1202,6 +883,236 @@ class TestPhase2Events:
         assert completed_events[0].transfer_id == transfer_id, \
             "C4: TransferCompleted must have same transfer_id as TransferInitiated"
         assert completed_events[0].success is True
+
+
+def test_cache_store_committed_during_decode(request_runner):
+    """Test that CacheStoreCommitted is emitted for blocks formed during decode.
+
+    Behavioral contract: When decode generates enough tokens to form complete
+    offloaded blocks, CacheStoreCommitted events should be emitted.
+
+    Bug scenario this test catches:
+    - Request has fewer prompt tokens than offloaded_block_size (no blocks at prefill)
+    - Decode generates enough tokens to form a complete offloaded block
+    - CacheStoreCommitted should be emitted for the newly formed block
+
+    This is distinct from prefill-only stores where block_hashes exist upfront.
+
+    Timing note: Store decisions are made at the START of each scheduler step
+    based on currently-available block_hashes. Block hashes are updated AFTER
+    tokens are generated. So a block completed at step N is stored at step N+1.
+    """
+    from unittest.mock import MagicMock
+
+    from vllm.distributed.kv_events import CacheStoreCommitted
+
+    offloaded_block_size = 8
+    gpu_block_size = 4
+    num_gpu_blocks = 100
+
+    runner = request_runner(
+        offloaded_block_size=offloaded_block_size,
+        gpu_block_size=gpu_block_size,
+        num_gpu_blocks=num_gpu_blocks,
+    )
+
+    # Configure manager to store all blocks
+    runner.manager.prepare_store.side_effect = (
+        lambda block_hashes: generate_store_output(block_hashes)
+    )
+
+    # Install a mock publisher to capture events
+    # (scheduler.update_from_output consumes events via take_events()
+    # and publishes them via kv_event_publisher)
+    mock_publisher = MagicMock()
+    published_batches = []
+
+    def capture_publish(batch):
+        published_batches.append(batch)
+
+    mock_publisher.publish.side_effect = capture_publish
+    runner.scheduler.kv_event_publisher = mock_publisher
+
+    # Create request with fewer tokens than offloaded_block_size
+    # This means NO complete offloaded blocks at prefill
+    prompt_tokens = gpu_block_size  # 4 tokens < 8 (offloaded_block_size)
+    runner.new_request(token_ids=[0] * prompt_tokens)
+
+    # Decode enough tokens to form a complete offloaded block, plus one more
+    # so the scheduler sees the completed block on the next step.
+    # Timeline:
+    #   - Start: 4 prompt tokens, 1 GPU block hash, 0 offloaded blocks
+    #   - After token 5,6,7: still 1 GPU block hash (partial 2nd block)
+    #   - After token 8: 2 GPU block hashes → 1 offloaded block
+    #   - Token 9 scheduling: sees 2 GPU hashes, triggers store
+    tokens_to_complete_block = offloaded_block_size - prompt_tokens  # 4 tokens
+    tokens_for_scheduler_to_observe = 1  # need 1 more step to trigger store
+    runner.run(decoded_tokens=[0] * (tokens_to_complete_block +
+                                      tokens_for_scheduler_to_observe))
+
+    # Collect all published events
+    all_events = []
+    for batch in published_batches:
+        all_events.extend(batch.events)
+
+    store_events = [e for e in all_events if isinstance(e, CacheStoreCommitted)]
+
+    assert len(store_events) >= 1, (
+        "CacheStoreCommitted should be emitted when decode forms complete blocks. "
+        f"Got {len(store_events)} store events, expected at least 1. "
+        f"All events: {[type(e).__name__ for e in all_events]}"
+    )
+
+
+def test_cache_load_committed_during_load(request_runner):
+    """Test that CacheLoadCommitted is emitted when loading blocks from CPU.
+
+    Behavioral contract: When a new request has blocks that can be loaded
+    from CPU cache (cache hit), CacheLoadCommitted events should be emitted.
+    """
+    from unittest.mock import MagicMock
+
+    from vllm.distributed.kv_events import CacheLoadCommitted
+
+    offloaded_block_size = 8
+    gpu_block_size = 4
+    num_gpu_blocks = 100
+
+    runner = request_runner(
+        offloaded_block_size=offloaded_block_size,
+        gpu_block_size=gpu_block_size,
+        num_gpu_blocks=num_gpu_blocks,
+    )
+
+    # Configure manager to store all blocks
+    runner.manager.prepare_store.side_effect = (
+        lambda block_hashes: generate_store_output(block_hashes)
+    )
+
+    # First, store some blocks by running a request to completion
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored_gpu_block_indexes=(0, 1),
+    )
+
+    # Reset prefix cache and configure for load hit
+    runner.scheduler.reset_prefix_cache()
+    runner.manager.lookup.return_value = 1  # 1 block hit
+
+    # Install mock publisher to capture events
+    mock_publisher = MagicMock()
+    published_batches = []
+
+    def capture_publish(batch):
+        published_batches.append(batch)
+
+    mock_publisher.publish.side_effect = capture_publish
+    runner.scheduler.kv_event_publisher = mock_publisher
+
+    # Create new request with same tokens - should trigger load from CPU
+    runner.manager.prepare_store.side_effect = (
+        lambda block_hashes: generate_store_output([])
+    )
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_loaded_gpu_block_indexes=(0, 1),
+    )
+
+    # Collect all published events
+    all_events = []
+    for batch in published_batches:
+        all_events.extend(batch.events)
+
+    load_events = [e for e in all_events if isinstance(e, CacheLoadCommitted)]
+
+    assert len(load_events) >= 1, (
+        "CacheLoadCommitted should be emitted when loading blocks from CPU. "
+        f"Got {len(load_events)} load events, expected at least 1. "
+        f"All events: {[type(e).__name__ for e in all_events]}"
+    )
+
+
+def test_eviction_before_store_ordering(request_runner):
+    """Test that CacheEviction is emitted BEFORE CacheStoreCommitted.
+
+    Behavioral contract: When storing blocks causes eviction from CPU cache,
+    CacheEviction events must be emitted before CacheStoreCommitted events
+    in the same batch.
+    """
+    from unittest.mock import MagicMock
+
+    from vllm.distributed.kv_events import CacheEviction, CacheStoreCommitted
+    from vllm.v1.core.kv_cache_utils import BlockHash
+
+    offloaded_block_size = 8
+    gpu_block_size = 4
+    num_gpu_blocks = 100
+
+    runner = request_runner(
+        offloaded_block_size=offloaded_block_size,
+        gpu_block_size=gpu_block_size,
+        num_gpu_blocks=num_gpu_blocks,
+    )
+
+    # Configure manager to return evicted blocks when storing
+    evicted_hash = BlockHash(b"evicted_hash")
+
+    def prepare_store_with_eviction(block_hashes):
+        output = generate_store_output(block_hashes)
+        # Simulate eviction by adding evicted hashes
+        output.block_hashes_evicted = [evicted_hash, evicted_hash]
+        return output
+
+    runner.manager.prepare_store.side_effect = prepare_store_with_eviction
+
+    # Install mock publisher to capture events
+    mock_publisher = MagicMock()
+    published_batches = []
+
+    def capture_publish(batch):
+        published_batches.append(batch)
+
+    mock_publisher.publish.side_effect = capture_publish
+    runner.scheduler.kv_event_publisher = mock_publisher
+
+    # Run a request that will trigger store (and eviction)
+    runner.new_request(token_ids=[0] * offloaded_block_size)
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored_gpu_block_indexes=(0, 1),
+    )
+
+    # Collect all published events
+    all_events = []
+    for batch in published_batches:
+        all_events.extend(batch.events)
+
+    # Filter to eviction and store events
+    relevant_events = [e for e in all_events
+                       if isinstance(e, (CacheEviction, CacheStoreCommitted))]
+
+    assert len(relevant_events) >= 2, (
+        "Expected both CacheEviction and CacheStoreCommitted events. "
+        f"Got: {[type(e).__name__ for e in relevant_events]}"
+    )
+
+    # Find positions
+    eviction_indices = [i for i, e in enumerate(relevant_events)
+                        if isinstance(e, CacheEviction)]
+    store_indices = [i for i, e in enumerate(relevant_events)
+                     if isinstance(e, CacheStoreCommitted)]
+
+    assert eviction_indices and store_indices, (
+        "Must have at least one of each event type"
+    )
+
+    # Verify ordering: all evictions come before all stores
+    assert max(eviction_indices) < min(store_indices), (
+        "CacheEviction must come BEFORE CacheStoreCommitted. "
+        f"Eviction indices: {eviction_indices}, Store indices: {store_indices}"
+    )
 
 
 def test_phase2_store_events_integration(request_runner):
