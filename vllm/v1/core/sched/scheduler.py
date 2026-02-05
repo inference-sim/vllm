@@ -73,6 +73,50 @@ except Exception:
 logger = init_logger(__name__)
 
 
+def collect_kv_events(
+    kv_cache_manager_events: list | None,
+    connector_events: Iterable | None,
+    kv_connector_output: KVConnectorOutput | None,
+) -> list | None:
+    """Collect KV cache events from all sources.
+
+    Combines events from three sources:
+    1. KV cache manager events (BlockStored, BlockRemoved)
+    2. Connector scheduler-side events (CacheLoadCommitted, CacheStoreCommitted, CacheEviction)
+    3. Connector worker-side events (TransferInitiated, TransferCompleted)
+
+    Args:
+        kv_cache_manager_events: Events from kv_cache_manager.take_events()
+        connector_events: Events from connector.take_events()
+        kv_connector_output: Output from worker containing kv_cache_events
+
+    Returns:
+        Combined list of events, or None if no events from any source.
+    """
+    events = kv_cache_manager_events
+
+    # Add connector scheduler-side events
+    if connector_events:
+        if events is None:
+            events = list(connector_events)
+        else:
+            events.extend(connector_events)
+
+    # Add connector worker-side events (TransferInitiated, TransferCompleted)
+    if (kv_connector_output is not None
+            and kv_connector_output.kv_cache_events is not None):
+        worker_events = kv_connector_output.kv_cache_events.get_all_events()
+        if worker_events:
+            if events is None:
+                events = list(worker_events)
+            else:
+                events.extend(worker_events)
+            # Clear worker events after extraction to prevent duplicate publishing
+            kv_connector_output.kv_cache_events.clear_events()
+
+    return events
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -1815,17 +1859,16 @@ class Scheduler(SchedulerInterface):
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
 
-        # collect KV cache events from KV cache manager
-        events = self.kv_cache_manager.take_events()
-
-        # collect KV cache events from connector
-        if self.connector is not None:
-            connector_events = self.connector.take_events()
-            if connector_events:
-                if events is None:
-                    events = list(connector_events)
-                else:
-                    events.extend(connector_events)
+        # collect KV cache events from all sources:
+        # 1. KV cache manager (BlockStored, BlockRemoved)
+        # 2. Connector scheduler-side (CacheLoadCommitted, CacheStoreCommitted, CacheEviction)
+        # 3. Connector worker-side (TransferInitiated, TransferCompleted)
+        events = collect_kv_events(
+            kv_cache_manager_events=self.kv_cache_manager.take_events(),
+            connector_events=(self.connector.take_events()
+                              if self.connector is not None else None),
+            kv_connector_output=kv_connector_output,
+        )
 
         # publish collected KV cache events
         if events:
