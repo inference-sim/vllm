@@ -173,11 +173,14 @@ cat kv_events.jsonl | jq -r '.[1][][0]' | sort | uniq -c
 ```
 
 Event types:
-- `BlockStored`: KV cache block added
-- `BlockRemoved`: KV cache block evicted
-- `AllBlocksCleared`: Cache cleared
-- `TransferInitiated` / `TransferCompleted`: Local DMA transfers (if offloading enabled)
-- `RemoteTransferInitiated` / `RemoteTransferCompleted`: Cross-machine transfers (if disaggregated)
+- `BlockStored`: KV cache block added to GPU cache
+- `BlockRemoved`: KV cache block evicted from GPU cache
+- `AllBlocksCleared`: GPU cache cleared
+- `CacheLoadCommitted`: Scheduler commits to loading blocks from CPU cache (offloading)
+- `CacheStoreCommitted`: Scheduler commits to storing blocks to CPU cache (offloading)
+- `CacheEviction`: Blocks evicted from CPU cache to make room (offloading)
+- `TransferInitiated` / `TransferCompleted`: GPU↔CPU DMA transfers (offloading)
+- `RemoteTransferInitiated` / `RemoteTransferCompleted`: Cross-machine transfers (disaggregated)
 
 For detailed event schema, see [KV_EVENTS_SUBSCRIBER.md](../examples/online_serving/KV_EVENTS_SUBSCRIBER.md).
 
@@ -196,6 +199,7 @@ For detailed event schema, see [KV_EVENTS_SUBSCRIBER.md](../examples/online_serv
 | `--step-tracing-closure-interval` | `10` | Close spans every 10 steps |
 | `--otlp-traces-endpoint` | `http://otel-collector:4318/v1/traces` | OTLP HTTP endpoint |
 | `--kv-events-config` | `{"enable_kv_cache_events": true, ...}` | KV events ZMQ publisher config |
+| `--kv-offloading-size` | `8.0` | CPU memory (GiB) for KV cache offloading |
 
 ### KV Events Config
 
