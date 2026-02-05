@@ -27,7 +27,7 @@ spec:
 
       containers:
         - name: vllm
-          image: ghcr.io/inference-sim/vllm:0.6.1
+          image: ghcr.io/inference-sim/vllm:0.6.2
           imagePullPolicy: IfNotPresent
 
           resources:
@@ -160,7 +160,7 @@ spec:
               mountPath: /data
 
         - name: kv-events-subscriber
-          image: ghcr.io/inference-sim/vllm:0.6.1
+          image: ghcr.io/inference-sim/vllm:0.6.2
           imagePullPolicy: IfNotPresent
           command:
             - python3
