@@ -55,6 +55,8 @@ spec:
             - "1024"
             - "--max-num-batched-tokens"
             - "1024"
+            - "--kv-offloading-size"
+            - "8.0"
 
           ports:
             - containerPort: 8000
@@ -324,6 +326,7 @@ spec:
 # - Step tracing with high sampling (10% batch, 10% rich) for debugging
 # - Fast span closure (every 10 steps) for quick test iteration
 # - KV cache events via ZMQ with sidecar subscriber writing JSONL
+# - CPU KV offloading enabled (8 GiB) for transfer event testing
 # - File exporter writes traces to persistent volume for extraction
 # - Debug pod allows easy trace file access via kubectl cp
 #
@@ -343,7 +346,9 @@ spec:
 # Expected events in kv_events.jsonl:
 # - BlockStored: KV cache blocks added
 # - BlockRemoved: KV cache blocks evicted
-# - Transfer events: Local/remote KV cache transfers (if offloading enabled)
+# - CacheStoreCommitted/CacheLoadCommitted: CPU offloading decisions
+# - TransferInitiated/TransferCompleted: GPU<->CPU KV cache transfers
+# - CacheEviction: Blocks evicted from CPU cache (if capacity exceeded)
 #
 apiVersion: v1
 kind: Pod
