@@ -57,6 +57,8 @@ spec:
             - "1024"
             - "--kv-offloading-size"
             - "8.0"
+            - "--gpu-memory-utilization"
+            - "0.1"
 
           ports:
             - containerPort: 8000
@@ -327,12 +329,13 @@ spec:
 # - Fast span closure (every 10 steps) for quick test iteration
 # - KV cache events via ZMQ with sidecar subscriber writing JSONL
 # - CPU KV offloading enabled (8 GiB) for transfer event testing
+# - Low GPU memory utilization (10%) to trigger offloading with fewer requests
 # - File exporter writes traces to persistent volume for extraction
 # - Debug pod allows easy trace file access via kubectl cp
 #
 # To extract and view data:
 # 1. Deploy: kubectl apply -f testk8s/collectanddebug.yaml
-# 2. Send requests to vLLM server
+# 2. Send 250+ concurrent requests to trigger CPU offloading (GPU cache ~200 req capacity)
 # 3. Wait ~15 seconds for traces to export
 # 4. Extract OTEL traces: kubectl cp pvc-debug:/mnt/data/traces.json ./traces.json
 # 5. Extract KV events:   kubectl cp pvc-debug:/mnt/data/kv_events.jsonl ./kv_events.jsonl

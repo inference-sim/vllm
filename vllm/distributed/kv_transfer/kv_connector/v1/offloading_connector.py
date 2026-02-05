@@ -422,17 +422,17 @@ class OffloadingConnectorScheduler:
             block_ids = self._request_block_ids[req_id]
 
             req = self._requests[req_id]
-            new_tokens = scheduler_output.num_scheduled_tokens[req_id]
-            total_tokens = req.num_computed_tokens + new_tokens
-            num_blocks = total_tokens // self.offloaded_block_size
+            # Calculate based on actual available block hashes, not predicted
+            # tokens. req.block_hashes only contains hashes for already-computed
+            # tokens, so we must not assume hashes exist for new_tokens being
+            # scheduled this step.
+            num_gpu_block_hashes = len(req.block_hashes)
+            num_blocks = num_gpu_block_hashes // self.block_size_factor
             start_block_idx = self._next_stored_block_idx.get(req_id, 0)
             num_new_blocks = num_blocks - start_block_idx
 
             if num_new_blocks <= 0:
                 continue
-
-            # NOTE: In async scheduling, placeholders may temporarily make
-            # len(req.block_hashes) < num_blocks * self.block_size_factor.
 
             new_block_hashes = self._get_block_hashes(
                 req, start_idx=start_block_idx, end_idx=num_blocks
