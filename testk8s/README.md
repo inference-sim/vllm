@@ -100,7 +100,7 @@ Run this in a separate terminal or background it with `&`.
 
 ### 5. Send inference requests
 
-Single request:
+**Quick test** (single short request to verify the server is working):
 ```bash
 curl -s http://localhost:8000/v1/completions \
   -H "Content-Type: application/json" \
@@ -112,20 +112,46 @@ curl -s http://localhost:8000/v1/completions \
   }' | jq .
 ```
 
-Multiple requests (10):
+**Trigger CPU KV offloading** (300 concurrent requests with long sequences):
+
+With `--gpu-memory-utilization 0.1`, vLLM gets ~8GB of GPU memory (10% of H100 80GB).
+After subtracting model weights (~250MB for opt-125m) and runtime overhead, the GPU
+KV cache is roughly 6-7GB, holding approximately 170-200K tokens. The separate
+`--kv-offloading-size 8.0` reserves 8GB of CPU memory for offloaded KV blocks.
+
+To trigger offloading, exceed the GPU KV cache capacity with concurrent long sequences:
+
 ```bash
-for i in {1..10}; do
+# Generate a ~900 token prompt base
+LONG_PROMPT=$(python3 -c "print('The ' * 450)")
+
+# Send 300 concurrent requests to exceed GPU KV cache capacity
+# Each prompt includes $i to prevent prefix cache hits
+for i in {1..300}; do
   curl -s http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
     -d '{
       "model": "opt-125m",
-      "prompt": "The meaning of life is",
-      "max_tokens": 20,
+      "prompt": "Request '"$i"': '"$LONG_PROMPT"'",
+      "max_tokens": 100,
       "temperature": 0.7
-    }' | jq -r '.choices[0].text'
-  echo "--- Request $i complete ---"
+    }' > /dev/null &
 done
+echo "Sent 300 requests, waiting for completion..."
+wait
+echo "All requests complete"
 ```
+
+This sends ~300K tokens into KV cache (300 requests × ~1000 tokens), exceeding the
+GPU capacity and forcing offloading to the CPU buffer.
+
+**Verify offloading occurred** by checking the KV events:
+```bash
+kubectl cp pvc-debug:/mnt/data/kv_events.jsonl ./kv_events.jsonl
+grep -c "CacheStoreCommitted\|CacheLoadCommitted\|TransferInitiated" kv_events.jsonl
+```
+
+If offloading triggered, you'll see non-zero counts for these event types.
 
 ### 6. Extract output files
 
