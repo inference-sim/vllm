@@ -109,6 +109,6 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
-            VLLM_BASE_VERSION=v0.14.1
+            VLLM_BASE_VERSION=v0.15.1
           cache-from: type=gha
           cache-to: type=gha,mode=max
