@@ -422,12 +422,20 @@ class OffloadingConnectorScheduler:
             block_ids = self._request_block_ids[req_id]
 
             req = self._requests[req_id]
-            # Calculate based on actual available block hashes, not predicted
-            # tokens. req.block_hashes only contains hashes for already-computed
-            # tokens, so we must not assume hashes exist for new_tokens being
-            # scheduled this step.
+            # Calculate num_blocks as the minimum of:
+            # 1. Blocks with hashes available (from req.block_hashes)
+            # 2. Blocks actually allocated (from block_ids)
+            #
+            # During chunked prefill, req.block_hashes contains hashes for ALL
+            # prompt tokens (computed at request creation), but block_ids only
+            # contains blocks allocated so far. We must not attempt to store
+            # blocks that haven't been allocated yet.
             num_gpu_block_hashes = len(req.block_hashes)
-            num_blocks = num_gpu_block_hashes // self.block_size_factor
+            num_allocated_gpu_blocks = len(block_ids)
+            num_blocks = min(
+                num_gpu_block_hashes // self.block_size_factor,
+                num_allocated_gpu_blocks // self.block_size_factor,
+            )
             start_block_idx = self._next_stored_block_idx.get(req_id, 0)
             num_new_blocks = num_blocks - start_block_idx
 

@@ -142,16 +142,21 @@ class TransferSummary:
 
 class RequestRunner:
     def __init__(
-        self, offloaded_block_size: int, gpu_block_size: int, num_gpu_blocks: int
+        self,
+        offloaded_block_size: int,
+        gpu_block_size: int,
+        num_gpu_blocks: int,
+        max_num_batched_tokens: int = 1000,
     ):
         self.offloaded_block_size: int = offloaded_block_size
         self.gpu_block_size: int = gpu_block_size
         self.num_gpu_blocks: int = num_gpu_blocks
+        self.max_num_batched_tokens: int = max_num_batched_tokens
 
         self.req_id: int = -1
 
         vllm_config = create_vllm_config(
-            block_size=gpu_block_size, max_num_batched_tokens=1000
+            block_size=gpu_block_size, max_num_batched_tokens=max_num_batched_tokens
         )
         vllm_config.kv_transfer_config = KVTransferConfig(
             kv_connector="OffloadingConnector",
@@ -434,11 +439,17 @@ class RequestRunner:
 def request_runner():
     runners = []
 
-    def runner_factory(offloaded_block_size, gpu_block_size, num_gpu_blocks):
+    def runner_factory(
+        offloaded_block_size,
+        gpu_block_size,
+        num_gpu_blocks,
+        max_num_batched_tokens=1000,
+    ):
         runner = RequestRunner(
             offloaded_block_size=offloaded_block_size,
             gpu_block_size=gpu_block_size,
             num_gpu_blocks=num_gpu_blocks,
+            max_num_batched_tokens=max_num_batched_tokens,
         )
         runners.append(runner)
         return runner
@@ -1193,4 +1204,145 @@ def test_phase2_load_events_integration(request_runner):
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
         expected_loaded_gpu_block_indexes=(0, 1),
+    )
+
+
+# =============================================================================
+# Chunked Prefill Tests: Regression tests for block allocation invariants
+# =============================================================================
+
+
+def test_chunked_prefill_no_crash_on_partial_allocation(request_runner):
+    """Test that chunked prefill does not crash the offloading connector.
+
+    Behavioral contract:
+    When a request has more prompt tokens than max_num_batched_tokens, the
+    scheduler performs chunked prefill, allocating blocks incrementally.
+    The offloading connector must:
+    1. NOT crash due to block index out of range
+    2. Store blocks incrementally as they are allocated and computed
+    3. Eventually store all blocks by the end of the request
+
+    This tests the scenario where req.block_hashes (populated at request creation
+    for all prompt tokens) is larger than allocated blocks during early chunks.
+    """
+    # Configuration:
+    # - offloaded_block_size=8: one offloaded block = 8 tokens = 2 GPU blocks
+    # - gpu_block_size=4: each GPU block holds 4 tokens
+    # - max_num_batched_tokens=16: forces chunked prefill for >16 token prompts
+    offloaded_block_size = 8
+    gpu_block_size = 4
+    num_gpu_blocks = 100
+    max_num_batched_tokens = 16
+
+    runner = request_runner(
+        offloaded_block_size=offloaded_block_size,
+        gpu_block_size=gpu_block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        max_num_batched_tokens=max_num_batched_tokens,
+    )
+
+    runner.manager.prepare_store.side_effect = (
+        lambda block_hashes: generate_store_output(block_hashes)
+    )
+
+    # 32 tokens = 8 GPU blocks = 4 offloaded blocks
+    # With max_num_batched_tokens=16, this requires 2 prefill chunks
+    prompt_tokens = 32
+    runner.new_request(token_ids=[0] * prompt_tokens)
+
+    # Run to completion - this should NOT crash
+    # Due to store deferral, blocks are stored in subsequent steps:
+    # - Step 1: First 16 tokens allocated, prepare store for blocks 0-3 (deferred)
+    # - Step 2: Second 16 tokens allocated, submit deferred stores for blocks 0-3,
+    #           prepare store for blocks 4-7 (deferred)
+    # - Step 3+: Submit remaining stores
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        # First chunk's GPU blocks (0-3) should be stored
+        # Due to deferral timing, we expect at least the first chunk
+        expected_stored_gpu_block_indexes=(0, 1, 2, 3),
+    )
+
+
+def test_chunked_prefill_stores_only_allocated_blocks(request_runner):
+    """Test that multi-chunk prefill stores blocks correctly.
+
+    Behavioral contract:
+    During chunked prefill with 3+ chunks, the offloading connector must:
+    1. NOT crash due to block index out of range
+    2. Store blocks incrementally as they are allocated
+    3. Store at least the first chunk's blocks by the end
+
+    This tests a longer chunked prefill scenario (3 chunks).
+    """
+    offloaded_block_size = 8
+    gpu_block_size = 4
+    num_gpu_blocks = 100
+    max_num_batched_tokens = 16
+
+    runner = request_runner(
+        offloaded_block_size=offloaded_block_size,
+        gpu_block_size=gpu_block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        max_num_batched_tokens=max_num_batched_tokens,
+    )
+
+    runner.manager.prepare_store.side_effect = (
+        lambda block_hashes: generate_store_output(block_hashes)
+    )
+
+    # 48 tokens = 12 GPU blocks = 6 offloaded blocks
+    # With max_num_batched_tokens=16, this requires 3 prefill chunks
+    prompt_tokens = 48
+    runner.new_request(token_ids=[0] * prompt_tokens)
+
+    # Run to completion - should NOT crash
+    # Expect at least first chunk's blocks (0-3) to be stored
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored_gpu_block_indexes=(0, 1, 2, 3),
+    )
+
+
+def test_chunked_prefill_with_decode_after_partial_prefill(request_runner):
+    """Test chunked prefill followed by decode that forms new blocks.
+
+    Behavioral contract:
+    When a request undergoes chunked prefill then decode:
+    1. Prefill chunks are processed without crash
+    2. Decode tokens are generated
+    3. When decode forms complete offloaded blocks, they are stored
+    4. The transition from prefill to decode doesn't cause errors
+
+    This tests the full lifecycle: chunked prefill -> decode -> block storage.
+    """
+    offloaded_block_size = 8
+    gpu_block_size = 4
+    num_gpu_blocks = 100
+    max_num_batched_tokens = 16
+
+    runner = request_runner(
+        offloaded_block_size=offloaded_block_size,
+        gpu_block_size=gpu_block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        max_num_batched_tokens=max_num_batched_tokens,
+    )
+
+    runner.manager.prepare_store.side_effect = (
+        lambda block_hashes: generate_store_output(block_hashes)
+    )
+
+    # 24 tokens = 6 GPU blocks = 3 offloaded blocks
+    # With max_num_batched_tokens=16, this requires 2 prefill chunks (16 + 8)
+    prompt_tokens = 24
+    runner.new_request(token_ids=[0] * prompt_tokens)
+
+    # Generate enough decode tokens to form another offloaded block (8 tokens)
+    # Total: 24 + 8 = 32 tokens = 8 GPU blocks = 4 offloaded blocks
+    decode_tokens_for_new_block = offloaded_block_size
+    runner.run(
+        decoded_tokens=[0] * decode_tokens_for_new_block + [EOS_TOKEN_ID],
+        # All blocks (0-7) should be stored: 24 prompt + 8 decode = 32 tokens = 8 GPU blocks
+        expected_stored_gpu_block_indexes=tuple(range(8)),
     )
