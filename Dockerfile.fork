@@ -25,7 +25,10 @@ COPY vllm /tmp/vllm-fork/
 
 # Overlay your Python changes on top of the installed vLLM
 # This preserves all compiled .so files while updating Python code
+# IMPORTANT: Remove _custom_ops.py to use base image's version - it must match
+# the compiled C++ extensions, and the fork's version may have mismatched op names
 RUN VLLM_LOCATION=$(cat /tmp/vllm_location.txt) && \
+    rm -f /tmp/vllm-fork/_custom_ops.py && \
     cp -r /tmp/vllm-fork/* "$VLLM_LOCATION/" && \
     rm -rf /tmp/vllm-fork && \
     echo "Overlaid fork Python code at $VLLM_LOCATION"
